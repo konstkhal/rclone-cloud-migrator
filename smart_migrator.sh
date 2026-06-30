@@ -4,21 +4,21 @@
 # RCLONE ARCHIVE & SYNC INTERACTIVE MIGRATOR
 # ==============================================================================
 # Description: On-the-fly streaming tar-archiver and raw sync tool with queue.
-# Framework: Clean Pure Bash CLI. No local disk space used for archiving.
-# Version: 3.0 (Fully Operational & Fixed)
+# Framework: Clean Pure Bash CLI.
+# Version: 3.0
 # ==============================================================================
 
-set -e
+set -eo pipefail
 
 # Global array to hold tasks in format: "SRC|DST|MODE|PURGE"
 declare -a TASK_QUEUE=()
 
-log_info() { echo -e "[\033[0;32mINFO\033[0m] $1"; }
-log_warn() { echo -e "[\033[0;33mWARN\033[0m] $1"; }
-log_err()  { echo -e "[\033[0;31mERROR\033[0m] $1"; }
+log_info() { echo -e "[\033[0;32mINFO\033[0m] $1" >&2; }
+log_warn() { echo -e "[\033[0;33mWARN\033[0m] $1" >&2; }
+log_err()  { echo -e "[\033[0;31mERROR\033[0m] $1" >&2; }
 
 # Check for required binaries
-for cmd in rclone tar; do
+for cmd in rclone tar fusermount; do
     if ! command -v "$cmd" &> /dev/null; then
         log_err "Required command '$cmd' is missing. Exiting."
         exit 1
@@ -38,29 +38,26 @@ if [ -z "$REMOTE_LIST" ]; then
     exit 1
 fi
 
-# Convert remotes to an array
-IFS=$'\n' read -r -d '' -a REMOTE_ARRAY <<< "$REMOTE_LIST" || true
-
 select_remote() {
     local prompt_msg="$1"
+    local i selected r_idx remote
     while true; do
-        echo -e "\nAvailable storage nodes:"
-        local i=0
-        # Делаем чистый разбор списка строк, без капризов форматирования
+        echo -e "\nAvailable storage nodes:" >&2
+        i=0
         while IFS= read -r remote; do
             if [ -n "$remote" ]; then
-                echo "  $i) $remote"
+                echo "  $i) $remote" >&2
                 REMOTE_ARRAY[$i]="$remote"
                 i=$((i + 1))
             fi
         done <<< "$REMOTE_LIST"
-        
-        echo "----------------------------------------------------------------------"
+
+        echo "----------------------------------------------------------------------" >&2
         read -r -p "$prompt_msg" r_idx
         if [[ "$r_idx" =~ ^[0-9]+$ ]] && [ "$r_idx" -lt "$i" ]; then
-            local selected="${REMOTE_ARRAY[$r_idx]}"
-            # Убираем пробелы и гарантируем двоеточие в конце
-            selected=$(echo "$selected" | tr -d ' ' | sed 's/:*$//'):
+            selected="${REMOTE_ARRAY[$r_idx]}"
+            selected="${selected// /}"
+            selected="${selected%:}:"
             echo "$selected"
             return 0
         else
@@ -86,7 +83,7 @@ configure_queue() {
         log_warn "No automatic top-level directories detected."
     else
         IFS=$'\n' read -r -d '' -a FOLDER_ARRAY <<< "$TOP_FOLDERS" || true
-        
+
         while true; do
             echo -e "\nDetected Top-Level Directories on Source:"
             local i=0
@@ -150,9 +147,10 @@ configure_queue() {
             # Push payload to queue
             TASK_QUEUE+=("${final_src}|${final_dst}|${mode}|${final_purge}")
             log_info "Successfully registered task to queue."
-            
-            # Blank out the configured folder so it's not picked twice
+
+            # Remove configured folder and reindex to keep array dense
             unset "FOLDER_ARRAY[$CHOSEN_IDX]"
+            FOLDER_ARRAY=("${FOLDER_ARRAY[@]}")
         done
     fi
 
@@ -168,7 +166,7 @@ configure_queue() {
                 echo "  1) [RAW] Copy folder contents 'as-is'"
                 echo "  2) [TAR] Stream folder into a .tar archive file"
                 read -r -p "Choose option (1-2): " FOLDER_OPT
-                
+
                 case "$FOLDER_OPT" in
                     1)
                         local mode="raw"
@@ -184,11 +182,11 @@ configure_queue() {
                         ;;
                     *) log_warn "Skipping entry."; continue ;;
                 esac
-                
+
                 read -r -p "Purge source directory upon verified success? (y/n): " purge_opt
                 local final_purge="no"
                 [[ "$purge_opt" == "y" || "$purge_opt" == "Y" ]] && final_purge="yes"
-                
+
                 TASK_QUEUE+=("${final_src}|${final_dst}|${mode}|${final_purge}")
                 log_info "Successfully registered manual task to queue."
             fi
@@ -247,32 +245,42 @@ PACER_FLAGS="--drive-pacer-burst 1 --drive-pacer-min-sleep 100ms --tpslimit 10 -
 
 for task in "${TASK_QUEUE[@]}"; do
     IFS='|' read -r src dst mode purge <<< "$task"
-    
+
     echo -e "\n----------------------------------------------------------------------"
     log_info "CRITICAL ENGAGEMENT: Starting deployment of $src"
     echo "----------------------------------------------------------------------"
 
     if [ "$mode" == "tar" ]; then
-        log_info "Profile selected: STREAM TAR MODE. Mounting live pipes..."
-        
-        # Corrected rclone streaming tar mechanism using built-in command
-        rclone tar cvf - "$src" 2>/dev/null | rclone rcat "$dst" $PACER_FLAGS --progress
-        
-        log_info "Validating remote archive container size..."
-        if rclone lsf "$dst" &> /dev/null; then
-            log_info "Container verification successful. Target file exists on target node."
+        log_info "Profile selected: STREAM TAR MODE. Mounting FUSE endpoint and piping..."
+
+        local_mnt=$(mktemp -d)
+        rclone mount "$src" "$local_mnt" --daemon --allow-non-empty
+        tar cvf - -C "$local_mnt" . | rclone rcat "$dst" $PACER_FLAGS --progress
+        pipe_status=("${PIPESTATUS[@]}")
+        fusermount -u "$local_mnt" 2>/dev/null || true
+        rmdir "$local_mnt" 2>/dev/null || true
+
+        if [ "${pipe_status[0]}" -ne 0 ] || [ "${pipe_status[1]}" -ne 0 ]; then
+            log_err "FATAL: TAR streaming pipeline failed for $src (tar=${pipe_status[0]}, rcat=${pipe_status[1]})"
+            continue
+        fi
+
+        log_info "Validating remote archive integrity..."
+        tar_size=$(rclone lsf --format s "$dst" 2>/dev/null | head -1)
+        if [[ "$tar_size" =~ ^[0-9]+$ ]] && [ "$tar_size" -gt 0 ]; then
+            log_info "Container verification successful. Archive size: ${tar_size} bytes."
             if [ "$purge" == "yes" ]; then
                 log_warn "Purge rule triggered. Erasing source from source node: $src"
                 rclone purge "$src"
             fi
         else
-            log_err "FATAL: Archive container verification failed for $dst"
+            log_err "FATAL: Archive verification failed for $dst — file missing or zero-byte."
         fi
 
     elif [ "$mode" == "raw" ]; then
         log_info "Profile selected: RAW DIRECT COPY SYNC MODE."
         rclone sync "$src" "$dst" --progress --buffer-size 32M $PACER_FLAGS --transfers 4 --checkers 4
-        
+
         log_info "Launching deep hash check validation matrix..."
         if rclone check "$src" "$dst" --checkers 4 --tpslimit 8; then
             log_info "Integrity matrix verified. Data matches."
@@ -287,5 +295,3 @@ for task in "${TASK_QUEUE[@]}"; do
 done
 
 log_info "All queue objectives successfully executed. Script complete."
-
-
