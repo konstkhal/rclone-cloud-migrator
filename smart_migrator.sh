@@ -73,11 +73,69 @@ echo "----------------------------------------------------------------------"
 log_info "Source Set: $GLOBAL_SRC_REMOTE | Destination Set: $GLOBAL_DST_REMOTE"
 echo "----------------------------------------------------------------------"
 
-# 3. Fetch Top-Level Structures from Source
+# 3. Fetch destination directory tree (top 2 levels) for interactive selection
+declare -a DST_DIRS_CACHE=()
+
+fetch_dst_directories() {
+    log_info "Scanning destination directories on ${GLOBAL_DST_REMOTE} (top 2 levels)..."
+    local top_dirs
+    top_dirs=$(rclone lsd "${GLOBAL_DST_REMOTE}" 2>/dev/null | awk '{print $NF}') || true
+    DST_DIRS_CACHE=()
+    if [ -z "$top_dirs" ]; then
+        log_warn "No directories found on destination remote root."
+        return
+    fi
+    while IFS= read -r dir; do
+        [ -z "$dir" ] && continue
+        DST_DIRS_CACHE+=("$dir")
+        local sub_dirs
+        sub_dirs=$(rclone lsd "${GLOBAL_DST_REMOTE}${dir}" 2>/dev/null | awk '{print $NF}') || true
+        while IFS= read -r sub; do
+            [ -z "$sub" ] && continue
+            DST_DIRS_CACHE+=("${dir}/${sub}")
+        done <<< "$sub_dirs"
+    done <<< "$top_dirs"
+    log_info "Found ${#DST_DIRS_CACHE[@]} destination director(ies)."
+}
+
+fetch_dst_directories
+
+# Present a numbered menu of discovered destination directories and return the chosen path.
+# Always outputs to stdout (for command substitution); all display goes to stderr.
+select_dst_path() {
+    local prompt_msg="$1"
+    while true; do
+        echo -e "\nAvailable destination directories on ${GLOBAL_DST_REMOTE}:" >&2
+        echo "  0) / (remote root)" >&2
+        local i=1
+        for d in "${DST_DIRS_CACHE[@]}"; do
+            echo "  $i) $d" >&2
+            i=$((i + 1))
+        done
+        echo "  m) Manually type a custom path" >&2
+        echo "----------------------------------------------------------------------" >&2
+        read -r -p "$prompt_msg" choice
+        if [ "$choice" == "m" ]; then
+            read -r -p "Enter custom destination path (relative to remote root): " custom_path
+            echo "$custom_path"
+            return 0
+        elif [ "$choice" == "0" ]; then
+            echo ""
+            return 0
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#DST_DIRS_CACHE[@]}" ]; then
+            echo "${DST_DIRS_CACHE[$((choice - 1))]}"
+            return 0
+        else
+            log_err "Invalid selection. Choose a number (0 for root) or 'm' for manual input."
+        fi
+    done
+}
+
+# 5. Fetch Top-Level Structures from Source
 log_info "Fetching top-level directories from $GLOBAL_SRC_REMOTE..."
 TOP_FOLDERS=$(rclone lsd "$GLOBAL_SRC_REMOTE" | awk '{print $NF}')
 
-# 4. Interactive Queue Configuration Core
+# 6. Interactive Queue Configuration Core
 configure_queue() {
     if [ -z "$TOP_FOLDERS" ]; then
         log_warn "No automatic top-level directories detected."
@@ -123,15 +181,27 @@ configure_queue() {
             case "$FOLDER_OPT" in
                 1)
                     local mode="raw"
-                    read -r -p "Enter destination path inside remote (e.g., Staging/hot_swap): " sub_dst
+                    local sub_dst
+                    sub_dst=$(select_dst_path "Select destination directory for '$target_folder' (index, 0=root, m=manual): ")
                     local final_src="${GLOBAL_SRC_REMOTE}${target_folder}"
-                    local final_dst="${GLOBAL_DST_REMOTE}${sub_dst}/${target_folder}"
+                    local final_dst
+                    if [ -n "$sub_dst" ]; then
+                        final_dst="${GLOBAL_DST_REMOTE}${sub_dst}/${target_folder}"
+                    else
+                        final_dst="${GLOBAL_DST_REMOTE}${target_folder}"
+                    fi
                     ;;
                 2)
                     local mode="tar"
-                    read -r -p "Enter destination directory inside remote (e.g., Staging/cryo_chamber): " sub_dst
+                    local sub_dst
+                    sub_dst=$(select_dst_path "Select destination directory for '${target_folder}.tar' (index, 0=root, m=manual): ")
                     local final_src="${GLOBAL_SRC_REMOTE}${target_folder}"
-                    local final_dst="${GLOBAL_DST_REMOTE}${sub_dst}/${target_folder}.tar"
+                    local final_dst
+                    if [ -n "$sub_dst" ]; then
+                        final_dst="${GLOBAL_DST_REMOTE}${sub_dst}/${target_folder}.tar"
+                    else
+                        final_dst="${GLOBAL_DST_REMOTE}${target_folder}.tar"
+                    fi
                     ;;
                 *)
                     log_warn "Invalid profile selected. Skipping configuration for this entry."
@@ -170,15 +240,27 @@ configure_queue() {
                 case "$FOLDER_OPT" in
                     1)
                         local mode="raw"
-                        read -r -p "Enter destination path (e.g., Staging/hot_swap): " sub_dst
+                        local sub_dst
+                        sub_dst=$(select_dst_path "Select destination directory for '${manual_folder##*/}' (index, 0=root, m=manual): ")
                         local final_src="${GLOBAL_SRC_REMOTE}${manual_folder}"
-                        local final_dst="${GLOBAL_DST_REMOTE}${sub_dst}/${manual_folder##*/}"
+                        local final_dst
+                        if [ -n "$sub_dst" ]; then
+                            final_dst="${GLOBAL_DST_REMOTE}${sub_dst}/${manual_folder##*/}"
+                        else
+                            final_dst="${GLOBAL_DST_REMOTE}${manual_folder##*/}"
+                        fi
                         ;;
                     2)
                         local mode="tar"
-                        read -r -p "Enter destination directory (e.g., Staging/cryo_chamber): " sub_dst
+                        local sub_dst
+                        sub_dst=$(select_dst_path "Select destination directory for '${manual_folder##*/}.tar' (index, 0=root, m=manual): ")
                         local final_src="${GLOBAL_SRC_REMOTE}${manual_folder}"
-                        local final_dst="${GLOBAL_DST_REMOTE}${sub_dst}/${manual_folder##*/}.tar"
+                        local final_dst
+                        if [ -n "$sub_dst" ]; then
+                            final_dst="${GLOBAL_DST_REMOTE}${sub_dst}/${manual_folder##*/}.tar"
+                        else
+                            final_dst="${GLOBAL_DST_REMOTE}${manual_folder##*/}.tar"
+                        fi
                         ;;
                     *) log_warn "Skipping entry."; continue ;;
                 esac
