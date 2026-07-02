@@ -62,6 +62,12 @@ The script is a single self-contained Bash file with no external dependencies be
 - RAW mode: purge fires only after `rclone check` passes with zero errors.
 - Source is never touched if any verification step fails.
 
+### Dry-Run Simulation Mode
+- Runs the entire queue with rclone's `--dry-run` flag so no data is copied, archived, moved, or deleted on any remote.
+- **Interactive prompt (default):** on every run without `-d`/`--dry-run`, the script asks `Would you like to perform a safe dry-run (simulation) first? [Y/n]` before touching any remote. Pressing Enter or `y` starts a simulation; `n` confirms LIVE mode.
+- **Direct flag mode:** pass `-d` or `--dry-run` on the command line to skip the prompt and start directly in simulation mode.
+- Verification and purge steps are skipped in dry-run — TAR mode logs that no archive was written, RAW mode logs that no data was changed, and the source is never purged.
+
 ---
 
 ## Requirements
@@ -99,6 +105,14 @@ The script reads `rclone listremotes` at startup and presents them as a numbered
 ```bash
 bash smart_migrator.sh
 ```
+
+By default the script asks whether to run a safe dry-run simulation first. To skip that prompt and go straight into simulation mode, pass `-d` or `--dry-run`:
+
+```bash
+bash smart_migrator.sh --dry-run
+```
+
+In dry-run mode every `rclone` operation runs with `--dry-run`, so no data is copied, archived, or deleted on any remote — use it to preview the task queue's effects safely.
 
 ### Session walkthrough
 
