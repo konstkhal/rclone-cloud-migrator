@@ -32,6 +32,42 @@ format_bytes() {
     }'
 }
 
+# Dry-run mode resolution — Direct Mode (-d/--dry-run flag) bypasses the
+# interactive safety prompt entirely; Default Mode always asks before
+# touching any remote.
+DRY_RUN_FLAG=""
+DIRECT_DRY_RUN_REQUESTED=0
+
+for arg in "$@"; do
+    if [ "$arg" == "-d" ] || [ "$arg" == "--dry-run" ]; then
+        DIRECT_DRY_RUN_REQUESTED=1
+        break
+    fi
+done
+
+if [ "$DIRECT_DRY_RUN_REQUESTED" -eq 1 ]; then
+    DRY_RUN_FLAG="--dry-run"
+    echo "=================================================="
+    echo -e "⚠️  RUNNING IN DIRECT DRY-RUN MODE (SIMULATION) ⚠️"
+    echo "=================================================="
+else
+    echo "----------------------------------------------------------------------"
+    log_warn "This script performs HEAVY cloud synchronization operations that can"
+    log_warn "copy, archive, and PERMANENTLY DELETE (purge) data on remote storage."
+    echo "----------------------------------------------------------------------"
+    read -r -p "Would you like to perform a safe dry-run (simulation) first? [Y/n] " DRY_RUN_CHOICE
+    case "$DRY_RUN_CHOICE" in
+        [Nn]*)
+            DRY_RUN_FLAG=""
+            log_warn "LIVE MODE confirmed. Real changes WILL be made to remote storage."
+            ;;
+        *)
+            DRY_RUN_FLAG="--dry-run"
+            log_info "Simulation starting. No data will be changed, moved, or deleted."
+            ;;
+    esac
+fi
+
 # Check for required binaries
 for cmd in rclone tar fusermount; do
     if ! command -v "$cmd" &> /dev/null; then
@@ -428,13 +464,18 @@ for task in "${TASK_QUEUE[@]}"; do
 
         local_mnt=$(mktemp -d)
         rclone mount "$src" "$local_mnt" --daemon --allow-non-empty
-        tar cvf - -C "$local_mnt" . | rclone rcat "$dst" $PACER_FLAGS --progress
+        tar cvf - -C "$local_mnt" . | rclone rcat "$dst" $PACER_FLAGS --progress $DRY_RUN_FLAG
         pipe_status=("${PIPESTATUS[@]}")
         fusermount -u "$local_mnt" 2>/dev/null || true
         rmdir "$local_mnt" 2>/dev/null || true
 
         if [ "${pipe_status[0]}" -ne 0 ] || [ "${pipe_status[1]}" -ne 0 ]; then
             log_err "FATAL: TAR streaming pipeline failed for $src (tar=${pipe_status[0]}, rcat=${pipe_status[1]})"
+            continue
+        fi
+
+        if [ -n "$DRY_RUN_FLAG" ]; then
+            log_info "[DRY-RUN] Simulation complete for $dst. No archive was written; skipping verification and purge."
             continue
         fi
 
@@ -452,7 +493,12 @@ for task in "${TASK_QUEUE[@]}"; do
 
     elif [ "$mode" == "raw" ]; then
         log_info "Profile selected: RAW DIRECT COPY SYNC MODE."
-        rclone sync "$src" "$dst" --progress --buffer-size 32M $PACER_FLAGS --transfers 4 --checkers 4
+        rclone sync "$src" "$dst" --progress --buffer-size 32M $PACER_FLAGS --transfers 4 --checkers 4 $DRY_RUN_FLAG
+
+        if [ -n "$DRY_RUN_FLAG" ]; then
+            log_info "[DRY-RUN] Simulation complete for $dst. No data was changed; skipping integrity check and purge."
+            continue
+        fi
 
         log_info "Launching deep hash check validation matrix..."
         if rclone check "$src" "$dst" --checkers 4 --tpslimit 8; then
