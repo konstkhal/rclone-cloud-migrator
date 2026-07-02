@@ -73,11 +73,11 @@ echo "----------------------------------------------------------------------"
 log_info "Source Set: $GLOBAL_SRC_REMOTE | Destination Set: $GLOBAL_DST_REMOTE"
 echo "----------------------------------------------------------------------"
 
-# 3. Fetch destination directory tree (top 2 levels) for interactive selection
+# 3. Fetch destination directory tree (top level) for interactive selection
 declare -a DST_DIRS_CACHE=()
 
 fetch_dst_directories() {
-    log_info "Scanning destination directories on ${GLOBAL_DST_REMOTE} (top 2 levels)..."
+    log_info "Scanning destination directories on ${GLOBAL_DST_REMOTE} (top level)..."
     local top_dirs
     top_dirs=$(rclone lsd "${GLOBAL_DST_REMOTE}" 2>/dev/null | awk '{print $NF}') || true
     DST_DIRS_CACHE=()
@@ -88,12 +88,6 @@ fetch_dst_directories() {
     while IFS= read -r dir; do
         [ -z "$dir" ] && continue
         DST_DIRS_CACHE+=("$dir")
-        local sub_dirs
-        sub_dirs=$(rclone lsd "${GLOBAL_DST_REMOTE}${dir}" 2>/dev/null | awk '{print $NF}') || true
-        while IFS= read -r sub; do
-            [ -z "$sub" ] && continue
-            DST_DIRS_CACHE+=("${dir}/${sub}")
-        done <<< "$sub_dirs"
     done <<< "$top_dirs"
     log_info "Found ${#DST_DIRS_CACHE[@]} destination director(ies)."
 }
