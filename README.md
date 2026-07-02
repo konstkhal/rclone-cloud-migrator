@@ -9,28 +9,28 @@ An interactive, queue-based multi-cloud migration tool built on top of [rclone](
 ## Architecture
 
 ```
-┌────────────────────────────────────────────────────────┐
-│             Interactive Configuration Phase             │
-│  Select source remote → select destination remote →    │
-│  browse top-level dirs → build ordered task queue      │
-└───────────────────────┬────────────────────────────────┘
-                        │
-          ┌─────────────▼─────────────┐
-          │      Task Queue Engine     │
-          │  [ src | dst | mode | purge ]  ...  │
-          └─────────────┬─────────────┘
-                        │
-          ┌─────────────▼─────────────────────────────────┐
-          │              Execution Core                     │
-          │                                                 │
-          │  TAR mode:  rclone mount (FUSE) → tar cf - │  │
-          │             rclone rcat  (streaming pipe)   │  │
-          │                                                 │
-          │  RAW mode:  rclone sync → rclone check      │  │
-          │             (cryptographic hash validation)  │  │
-          │                                                 │
-          │  Post-transfer: optional rclone purge src   │  │
-          └─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│           Interactive Configuration Phase            │
+│  Select source remote → select destination remote →  │
+│  browse top-level dirs → build ordered task queue    │
+└───────────────────────────┬──────────────────────────┘
+                            │
+          ┌──────────────────▼─────────────────┐
+          │         Task Queue Engine          │
+          │  [ src | dst | mode | purge ] ...  │
+          └──────────────────┬─────────────────┘
+                             │
+          ┌──────────────────▼───────────────────────────┐
+          │                Execution Core                │
+          │                                              │
+          │  TAR mode:  rclone mount (FUSE) → tar cf -   │
+          │             rclone rcat  (streaming pipe)    │
+          │                                              │
+          │  RAW mode:  rclone sync → rclone check       │
+          │             (cryptographic hash validation)  │
+          │                                              │
+          │  Post-transfer: optional rclone purge src    │
+          └──────────────────────────────────────────────┘
 ```
 
 The script is a single self-contained Bash file with no external dependencies beyond `rclone`, `tar`, and `fusermount`.
