@@ -16,21 +16,30 @@ An interactive, queue-based multi-cloud migration tool built on top of [rclone](
 └───────────────────────────┬──────────────────────────┘
                             │
           ┌──────────────────▼─────────────────┐
-          │         Task Queue Engine          │
-          │  [ src | dst | mode | purge ] ...  │
+          │         Core::QueueManager         │
+          │  [ src | dst | mode | purge |      │
+          │    chunk_bytes | buffer_dir ] ...  │
           └──────────────────┬─────────────────┘
                              │
-          ┌──────────────────▼───────────────────────────┐
-          │                Execution Core                │
-          │                                              │
-          │  TAR mode:  rclone mount (FUSE) → tar cf -   │
-          │             rclone rcat  (streaming pipe)    │
-          │                                              │
-          │  RAW mode:  rclone sync → rclone check       │
-          │             (cryptographic hash validation)  │
-          │                                              │
-          │  Post-transfer: optional rclone purge src    │
-          └──────────────────────────────────────────────┘
+          ┌──────────────────▼────────────────────────────┐
+          │                 Execution Core                │
+          │                                               │
+          │  TAR mode:       rclone mount (FUSE) →        │
+          │                  tar cf - → rclone rcat       │
+          │                  (streaming pipe)             │
+          │                                               │
+          │  RAW mode:       rclone copy → rclone check   │
+          │                  (cryptographic hash          │
+          │                   validation)                 │
+          │                                               │
+          │  TAR-CHUNK mode: recursive scan → bin-pack →  │
+          │                  local tar → rclone copy →    │
+          │                  remote verify → chunk purge  │
+          │                  (Engine::ChunkPacker /       │
+          │                   Engine::CloudTransfer)      │
+          │                                               │
+          │  Post-transfer:  optional rclone purge src    │
+          └───────────────────────────────────────────────┘
 ```
 
 The script is a single self-contained Bash file with no external dependencies beyond `rclone`, `tar`, and `fusermount`.
@@ -45,21 +54,30 @@ The script is a single self-contained Bash file with no external dependencies be
 - Produces a single `.tar` archive at the destination without buffering the full archive locally.
 - Post-stream size verification confirms the archive is non-zero before any purge action.
 
-### RAW Sync Mode with Cryptographic Hash Verification
-- Transfers data with `rclone sync` (multi-transfer, buffered).
+### RAW Copy Mode with Cryptographic Hash Verification
+- Transfers data with `rclone copy` (multi-transfer, buffered, non-destructive — never deletes anything at the destination).
 - Follows every transfer with `rclone check` to compare source and destination using backend-native checksums (MD5, SHA-1, or equivalent depending on the remote).
 - Purge is gated: the source is only deleted if the hash check exits cleanly.
+
+### TAR-CHUNK Mode — Size-Bounded Local Archives with Incremental Purge
+- Recursively scans the full source tree (`rclone lsf -R`), however deeply nested, so no subdirectory is invisible to the packer.
+- Greedy bin-packs the file manifest into archives no larger than a configurable `chunk_bytes` limit (e.g. `50G`, `500M`, or a raw byte count).
+- Per chunk: build a local tar from a FUSE-mounted view of the source → verify local archive integrity → push with `rclone copy` → verify the remote copy's size → purge only the source files that made it into that chunk → flush the local buffer.
+- Fails safe: any error at any stage halts the entire pipeline immediately (`Diagnostics::halt_chunk_pipeline`), leaving the local buffer, remaining source data, and destination untouched for manual inspection — it never silently skips ahead.
+- Dry-run aware: chunks are still built and locally verified for a realistic preview, but remote push, verification, purge, and buffer flush are skipped.
+- Useful for very large or deeply nested folders where a single unified TAR archive (see TAR mode above) would be impractical to build, push, or recover from if interrupted.
 
 ### Interactive Queue Builder
 - Numbered menus for remote selection and destination directory browsing.
 - Supports both auto-discovered top-level folders and manually typed nested paths.
-- Each queue entry carries its own mode (`raw` / `tar`) and purge flag (`yes` / `no`).
+- Each queue entry carries its own mode (`raw` / `tar` / `tar-chunk`) and purge flag (`yes` / `no`), plus chunk size and local buffer path for `tar-chunk` entries.
 - Queue is reviewable and resettable before execution begins.
 
 ### Post-Transfer Safe Purge
 - Configurable per task at queue-build time.
 - TAR mode: purge fires only after size validation confirms a non-zero remote archive.
 - RAW mode: purge fires only after `rclone check` passes with zero errors.
+- TAR-CHUNK mode: purge is incremental — only the source files inside a chunk are deleted, and only after that chunk's remote copy is verified.
 - Source is never touched if any verification step fails.
 
 ### Dry-Run Simulation Mode
@@ -120,8 +138,9 @@ In dry-run mode every `rclone` operation runs with `--dry-run`, so no data is co
 2. **Select destination remote** — same list, pick the target backend.
 3. **Browse destination** — top-level directories on the destination are fetched and presented as a menu. Choose `0` for root or `m` to type a custom path.
 4. **Build the queue** — for each source folder, select:
-   - `1` → RAW mode (direct sync)
+   - `1` → RAW mode (direct copy)
    - `2` → TAR mode (streaming archive)
+   - `3` → TAR-CHUNK mode (size-limited local archives with incremental purge) — enter a max chunk size and a local exchange buffer directory when prompted
    - Whether to purge the source after verified transfer
 5. **Add manual paths** — optionally add explicit nested source paths not shown in the top-level list.
 6. **Review and execute** — inspect the full task queue, then launch or reconfigure.
@@ -138,7 +157,7 @@ Detected Top-Level Directories on Source:
   2) Documents
 
 Select a folder index to configure: 0              # Projects
-Choose option (1-2): 2                             # TAR mode
+Choose option (1-3): 2                             # TAR mode
 Select destination directory: 0                    # b2: root
 Purge source upon verified success? (y/n): n
 
@@ -146,12 +165,28 @@ Select a folder index to configure: q              # done
 Choose engine action (1-3): 1                      # execute
 ```
 
-### Example: two-remote raw sync with post-transfer purge
+### Example: two-remote raw copy with post-transfer purge
 
 ```bash
 # After selecting remotes and folders interactively:
 # Mode: RAW, Purge: yes
-# → rclone sync src: dst: && rclone check src: dst: && rclone purge src:
+# → rclone copy src: dst: && rclone check src: dst: && rclone purge src:
+```
+
+### Example: chunked archive migration for a large nested folder
+
+```
+Select a folder index to configure: 0              # Archive (500 GB, deeply nested)
+Choose option (1-3): 3                              # TAR-CHUNK mode
+Enter max chunk size per local archive batch: 50G
+Enter local exchange buffer directory: /mnt/scratch/migration_buffer
+Select destination directory: 0                     # dst: root
+Purge source upon verified success? (y/n): y
+
+Select a folder index to configure: q               # done
+Choose engine action (1-3): 1                       # execute
+# → recursively scans Archive/, bin-packs into ~10 chunks of <=50G each,
+#   builds/pushes/verifies/purges one chunk at a time
 ```
 
 ---
@@ -168,6 +203,14 @@ The execution core applies conservative API pacing flags by default to avoid hit
 ```
 
 Adjust `PACER_FLAGS` in the script if your remotes support higher throughput or have different rate limits.
+
+---
+
+## Changelog
+
+Version history and a description of what changed in each release lives in [CHANGELOG.md](CHANGELOG.md).
+
+**Current version: 4.0** — adds TAR-CHUNK mode (recursive scan, size-bounded local archives, incremental per-chunk purge), refactors the queue/execution engine into `Core::QueueManager` / `Engine::ChunkPacker` / `Engine::CloudTransfer` / `System::Diagnostics` namespaces, and switches RAW mode from `rclone sync` to `rclone copy` so overlapping destination paths are never destructively deleted.
 
 ---
 
