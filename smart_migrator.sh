@@ -5,7 +5,7 @@
 # ==============================================================================
 # Description: On-the-fly streaming tar-archiver and raw copy tool with queue.
 # Framework: Modular pseudoclass-style Bash CLI (Core/Engine/System namespaces).
-# Version: 4.0
+# Version: 4.1
 # ==============================================================================
 
 set -eo pipefail
@@ -51,6 +51,25 @@ parse_size_to_bytes() {
     else
         echo ""
     fi
+}
+
+# Strict white-list input prompt. Re-prompts until the raw input is exactly
+# one of the single characters in $valid_chars (case-sensitive, no leading/
+# trailing junk) — rejects empty input, stray carriage returns, multi-char
+# strings, and out-of-set characters (e.g. Cyrillic look-alikes) instead of
+# silently defaulting. Echoes the validated character to stdout so callers
+# can capture it via command substitution; the prompt itself goes to stderr
+# (bash's `read -p` behavior), so it never pollutes the captured value.
+prompt_strict_choice() {
+    local prompt_msg="$1" valid_chars="$2" label="$3" answer
+    while true; do
+        read -r -p "$prompt_msg" answer
+        if [[ "$answer" =~ ^[${valid_chars}]$ ]]; then
+            echo "$answer"
+            return 0
+        fi
+        log_err "Invalid input. Please enter exactly one of: $label"
+    done
 }
 
 # 1. Dry-run mode resolution — Direct Mode (-d/--dry-run flag) bypasses the
@@ -233,7 +252,8 @@ select_dst_path() {
         elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#menu_dirs[@]}" ]; then
             current_path="${current_path}/${menu_dirs[$((choice - 1))]}"
 
-            read -r -p "Drill down deeper into this directory? (y/n): " drill_opt
+            local drill_opt
+            drill_opt=$(prompt_strict_choice "Drill down deeper into this directory? (y/n): " "yYnN" "y or n")
             if [[ "$drill_opt" == "y" || "$drill_opt" == "Y" ]]; then
                 local sub_listing
                 sub_listing=$(rclone lsf --dirs-only --dir-slash=false "${GLOBAL_DST_REMOTE}${current_path}" 2>/dev/null) || true
@@ -380,7 +400,8 @@ configure_queue() {
 
             # Infinite on-demand recursive drilldown into subfolders
             while true; do
-                read -r -p "Drill down deeper into this directory? (y/n): " drill_opt
+                local drill_opt
+                drill_opt=$(prompt_strict_choice "Drill down deeper into this directory? (y/n): " "yYnN" "y or n")
                 if [[ "$drill_opt" == "y" || "$drill_opt" == "Y" ]]; then
                     local sub_listing
                     sub_listing=$(rclone lsf --dirs-only --dir-slash=false "${GLOBAL_SRC_REMOTE}${target_folder}" 2>/dev/null) || true
@@ -444,7 +465,7 @@ configure_queue() {
             echo "  1) [RAW] Copy folder contents 'as-is' to destination directory"
             echo "  2) [TAR] Stream entire folder into a single unified .tar archive file"
             echo "  3) [TAR-CHUNK] Build size-limited local archives with incremental purge"
-            read -r -p "Choose option (1-3): " FOLDER_OPT
+            FOLDER_OPT=$(prompt_strict_choice "Choose option (1-3): " "123" "1, 2, or 3")
 
             # Reset per-iteration chunk fields so a prior TAR-CHUNK selection can't
             # leak its values into this iteration's queue entry if a different mode is chosen.
@@ -538,7 +559,8 @@ configure_queue() {
             esac
 
             # Ask for Post-Processing Purge Rule
-            read -r -p "Purge and delete source directory from source node upon verified success? (y/n): " purge_opt
+            local purge_opt
+            purge_opt=$(prompt_strict_choice "Purge and delete source directory from source node upon verified success? (y/n): " "yYnN" "y or n")
             local final_purge="no"
             [[ "$purge_opt" == "y" || "$purge_opt" == "Y" ]] && final_purge="yes"
 
@@ -565,7 +587,7 @@ while true; do
     echo "  1) Launch current deployment task queue execution engine"
     echo "  2) Reset and re-configure queue from scratch"
     echo "  3) Exit system completely"
-    read -r -p "Choose engine action (1-3): " EXEC_OPT
+    EXEC_OPT=$(prompt_strict_choice "Choose engine action (1-3): " "123" "1, 2, or 3")
 
     if [ "$EXEC_OPT" -eq 3 ] 2>/dev/null; then
         log_info "Terminating engine. Goodbye."
