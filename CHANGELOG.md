@@ -2,6 +2,14 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [4.1] - 2026-07-06
+
+### Added
+- `prompt_strict_choice()` — a shared white-list input helper that re-prompts until the raw answer is exactly one of a given single-character set, rejecting empty input, stray carriage returns, multi-character strings, and out-of-set characters (e.g. Cyrillic look-alikes) instead of silently defaulting.
+
+### Changed
+- Wired `prompt_strict_choice()` into the four menu prompts most exposed to garbage input: profile choice (`1`-`3`), engine action (`1`-`3`), purge confirmation (`y`/`n`), and both recursive folder drill-down prompts (`y`/`n`) — one in `select_dst_path`, one in `configure_queue`.
+
 ## [4.0] - 2026-07-06
 
 ### Added
