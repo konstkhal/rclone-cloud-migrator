@@ -740,7 +740,11 @@ TRANSFER_PUSHED_BYTES=0
 
 Transfer::resumable_push() {
     local local_tar="$1" dst_dir="$2"
-    rclone copy "$local_tar" "${dst_dir%/}/" $PACER_FLAGS --progress
+    local rc=0
+    rclone copy "$local_tar" "${dst_dir%/}/" $PACER_FLAGS --progress || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        return "$rc"
+    fi
     local pushed_bytes
     pushed_bytes=$(stat -c%s "$local_tar" 2>/dev/null || echo 0)
     TRANSFER_PUSHED_CHUNKS=$((TRANSFER_PUSHED_CHUNKS + 1))

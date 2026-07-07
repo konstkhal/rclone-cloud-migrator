@@ -2,6 +2,11 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [4.1.1] - 2026-07-07
+
+### Fixed
+- `Transfer::resumable_push()` discarded `rclone copy`'s exit status — the function always returned success regardless of whether the push actually landed, so a failed chunk push could only ever be caught downstream by the remote size check in `Transfer::verify_remote_mass()`. The function now captures and propagates `rclone copy`'s real exit code, so a failed push halts the TAR-CHUNK pipeline immediately via `Diagnostics::halt_chunk_pipeline` instead of relying solely on the secondary size-verification step.
+
 ## [4.1] - 2026-07-06
 
 ### Added
