@@ -11,12 +11,47 @@
 set -eo pipefail
 
 # ---------------------------------------------------------------------------
-# System::Diagnostics — logging primitives. Defined first since every other
-# module calls into these.
+# System::Diagnostics — logging primitives, durable execution log, and the
+# crash-safety trap. Defined first since every other module calls into these.
+# The durable log lives next to the script rather than in a task's buffer
+# dir, since the default buffer dir is under /tmp and can be wiped on
+# reboot — exactly the kind of event that can follow an overnight crash.
 # ---------------------------------------------------------------------------
-log_info() { echo -e "[\033[0;32mINFO\033[0m] $1" >&2; }
-log_warn() { echo -e "[\033[0;33mWARN\033[0m] $1" >&2; }
-log_err()  { echo -e "[\033[0;31mERROR\033[0m] $1" >&2; }
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOG_DIR="${SCRIPT_DIR}/logs"
+mkdir -p "$LOG_DIR" 2>/dev/null || true
+LOG_FILE="${LOG_DIR}/smart_migrator_$(date '+%Y%m%d_%H%M%S')_$$.log"
+
+_log_persist() { printf '%s\n' "$1" >> "$LOG_FILE" 2>/dev/null || true; }
+
+log_info() { echo -e "[\033[0;32mINFO\033[0m] $1" >&2; _log_persist "$(date '+%F %T') [INFO] $1"; }
+log_warn() { echo -e "[\033[0;33mWARN\033[0m] $1" >&2; _log_persist "$(date '+%F %T') [WARN] $1"; }
+log_err()  { echo -e "[\033[0;31mERROR\033[0m] $1" >&2; _log_persist "$(date '+%F %T') [ERROR] $1"; }
+
+# CONTROLLED_HALT lets a deliberate, fully-diagnosed halt
+# (Diagnostics::halt_chunk_pipeline) suppress cleanup_on_exit's generic
+# "terminated unexpectedly" line below, since it already logs its own
+# complete banner. Without it the two mechanisms would double-log every
+# controlled halt. Cannot catch SIGKILL/OOM — best-effort forensics only.
+CURRENT_MOUNT_DIR=""
+CURRENT_STAGE="STARTUP"
+CONTROLLED_HALT=0
+TRAP_SIGNAL=""
+
+cleanup_on_exit() {
+    local exit_code=$?
+    if [ -n "$CURRENT_MOUNT_DIR" ] && mountpoint -q "$CURRENT_MOUNT_DIR" 2>/dev/null; then
+        fusermount -u "$CURRENT_MOUNT_DIR" 2>/dev/null || true
+        rmdir "$CURRENT_MOUNT_DIR" 2>/dev/null || true
+    fi
+    if [ "$CONTROLLED_HALT" -eq 0 ] && { [ "$exit_code" -ne 0 ] || [ -n "$TRAP_SIGNAL" ]; }; then
+        log_err "process terminated unexpectedly at stage: ${CURRENT_STAGE} (exit=${exit_code}${TRAP_SIGNAL:+, signal=$TRAP_SIGNAL})"
+    fi
+}
+trap cleanup_on_exit EXIT
+trap 'TRAP_SIGNAL=INT;  exit 130' INT
+trap 'TRAP_SIGNAL=TERM; exit 143' TERM
+trap 'TRAP_SIGNAL=HUP;  exit 129' HUP
 
 # Convert a raw byte count into a human-readable MB/GB string.
 format_bytes() {
@@ -611,6 +646,7 @@ done
 log_info "Initializing pipeline engines. Total jobs in pool: $(Queue::size)"
 
 PACER_FLAGS="--drive-pacer-burst 1 --drive-pacer-min-sleep 100ms --tpslimit 10 --low-level-retries 15"
+DROPBOX_PACER_FLAGS="--tpslimit 4 --low-level-retries 10"
 
 # ---------------------------------------------------------------------------
 # System::Diagnostics (continued) — transactional abort handler for the
@@ -621,6 +657,7 @@ PACER_FLAGS="--drive-pacer-burst 1 --drive-pacer-min-sleep 100ms --tpslimit 10 -
 # ---------------------------------------------------------------------------
 Diagnostics::halt_chunk_pipeline() {
     local stage="$1" detail="$2" chunk_tar="$3" mnt="$4" src_path="$5" dst_path="$6"
+    CONTROLLED_HALT=1
     echo "" >&2
     echo "========================================================================" >&2
     log_err "TAR-CHUNK PIPELINE HALTED — manual intervention required"
@@ -631,11 +668,25 @@ Diagnostics::halt_chunk_pipeline() {
     echo "  Destination Path:     $dst_path" >&2
     echo "  Local buffer and remaining source data left untouched for inspection." >&2
     echo "========================================================================" >&2
+    _log_persist "  Failed Stage:         $stage"
+    _log_persist "  Detail:               $detail"
+    _log_persist "  Preserved Local Tar:  ${chunk_tar:-N/A (not yet created)}"
+    _log_persist "  Source Remote Path:   $src_path"
+    _log_persist "  Destination Path:     $dst_path"
     if [ -n "$mnt" ]; then
         fusermount -u "$mnt" 2>/dev/null || true
         rmdir "$mnt" 2>/dev/null || true
     fi
     exit 1
+}
+
+# Records progress through one chunk's build/push/verify/purge/flush
+# lifecycle to the durable log, and updates CURRENT_STAGE so cleanup_on_exit
+# can report exactly where an uncaught termination happened.
+Diagnostics::mark_phase() {
+    local chunk_idx="$1" chunk_total="$2" stage="$3" chunk_tar="$4"
+    CURRENT_STAGE="CHUNK_${chunk_idx}/${chunk_total}:${stage}"
+    log_info "[CHUNK ${chunk_idx}/${chunk_total}] PHASE=${stage} tar=${chunk_tar}"
 }
 
 # ---------------------------------------------------------------------------
@@ -652,19 +703,63 @@ PACKER_SOURCE_PATH=""
 PACKER_BUFFER_PATH=""
 PACKER_MAX_CHUNK_SIZE=0
 PACKER_PURGE_ON_SUCCESS="no"
+PACKER_NEXT_CHUNK_IDX=0
+PACKER_STATE_FILE=""
 
 declare -a PACKER_MANIFEST_PATHS=()
 declare -a PACKER_MANIFEST_SIZES=()
 declare -a PACKER_CHUNKS=()   # each element: \x1f-joined relative file paths for one chunk
 
+# dst_dir (5th param) scopes the persisted chunk index by source+destination,
+# so chunk numbering survives a restart instead of resetting to 1 and
+# colliding with already-completed chunks on the remote. The state file
+# lives next to the script (not in buffer_dir) for the same reason as the
+# durable log: buffer_dir defaults under /tmp and can be wiped on reboot.
 Packer::init() {
     PACKER_SOURCE_PATH="$1"
     PACKER_BUFFER_PATH="$2"
     PACKER_MAX_CHUNK_SIZE="$3"
     PACKER_PURGE_ON_SUCCESS="$4"
+    local dst_dir="$5"
     PACKER_MANIFEST_PATHS=()
     PACKER_MANIFEST_SIZES=()
     PACKER_CHUNKS=()
+
+    local state_dir="${SCRIPT_DIR}/state"
+    mkdir -p "$state_dir" 2>/dev/null || true
+    local task_key="${PACKER_SOURCE_PATH}__${dst_dir}"
+    task_key="${task_key//[^A-Za-z0-9._-]/_}"
+    PACKER_STATE_FILE="${state_dir}/.chunk_idx__${task_key}.state"
+
+    if [ -f "$PACKER_STATE_FILE" ]; then
+        PACKER_NEXT_CHUNK_IDX=$(cat "$PACKER_STATE_FILE" 2>/dev/null)
+        [[ "$PACKER_NEXT_CHUNK_IDX" =~ ^[0-9]+$ ]] || PACKER_NEXT_CHUNK_IDX=0
+    else
+        # No local record yet — either this task's first run, or the state
+        # file was lost. Reconcile against whatever chunks already exist on
+        # the destination instead of assuming 0, so numbering can't collide
+        # with completed work even on the very first run after this
+        # tracking was introduced.
+        local folder_name highest=0 f n
+        folder_name=$(basename "${PACKER_SOURCE_PATH%/}")
+        while IFS= read -r f; do
+            case "$f" in
+                "${folder_name}".part[0-9][0-9][0-9].tar)
+                    n="${f#"${folder_name}".part}"
+                    n="${n%.tar}"
+                    n=$((10#$n))
+                    [ "$n" -gt "$highest" ] && highest="$n"
+                    ;;
+            esac
+        done < <(rclone lsf --files-only "${dst_dir%/}/" --tpslimit 10 --low-level-retries 15 2>/dev/null)
+        PACKER_NEXT_CHUNK_IDX="$highest"
+    fi
+}
+
+# Write-to-temp-then-mv avoids a torn state file if interrupted mid-write.
+Packer::persist_chunk_idx() {
+    local idx="$1" tmp="${PACKER_STATE_FILE}.tmp.$$"
+    printf '%s\n' "$idx" > "$tmp" && mv "$tmp" "$PACKER_STATE_FILE"
 }
 
 # Builds a flat manifest of every file under source_path, however deeply
@@ -679,7 +774,7 @@ Packer::scan_payload() {
         [[ "$size" =~ ^[0-9]+$ ]] || size=0
         PACKER_MANIFEST_PATHS+=("$relpath")
         PACKER_MANIFEST_SIZES+=("$size")
-    done < <(rclone lsf -R --files-only --format "sp" --separator $'\t' "$PACKER_SOURCE_PATH" 2>/dev/null)
+    done < <(rclone lsf -R --files-only --format "sp" --separator $'\t' "$PACKER_SOURCE_PATH" $DROPBOX_PACER_FLAGS 2>/dev/null)
     log_info "Manifest complete: ${#PACKER_MANIFEST_PATHS[@]} file(s) discovered across all nesting levels."
 }
 
@@ -773,10 +868,11 @@ Transfer::purge_source_manifest() {
     local -a items=("$@")
     local item
     for item in "${items[@]}"; do
-        if ! rclone deletefile "${src_root%/}/${item}" 2>/dev/null; then
+        if ! rclone deletefile "${src_root%/}/${item}" $DROPBOX_PACER_FLAGS 2>/dev/null; then
             echo "Failed to delete processed source item: ${src_root%/}/${item}"
             return 1
         fi
+        sleep 0.25
     done
 }
 
@@ -795,7 +891,7 @@ run_tar_chunk_pipeline() {
         Diagnostics::halt_chunk_pipeline "BUFFER_INIT" "Cannot create local buffer directory: $buffer_dir" "" "" "$src" "$dst_dir"
     fi
 
-    Packer::init "$src" "$buffer_dir" "$chunk_bytes" "$purge"
+    Packer::init "$src" "$buffer_dir" "$chunk_bytes" "$purge" "$dst_dir"
     Packer::scan_payload
 
     if [ ${#PACKER_MANIFEST_PATHS[@]} -eq 0 ]; then
@@ -809,6 +905,7 @@ run_tar_chunk_pipeline() {
     local local_mnt
     local_mnt=$(mktemp -d)
     rclone mount "$src" "$local_mnt" --daemon --allow-non-empty
+    CURRENT_MOUNT_DIR="$local_mnt"
 
     local mount_wait=0
     until mountpoint -q "$local_mnt" || [ "$mount_wait" -ge 20 ]; do
@@ -819,7 +916,7 @@ run_tar_chunk_pipeline() {
         Diagnostics::halt_chunk_pipeline "MOUNT" "FUSE mount did not become ready at $local_mnt" "" "$local_mnt" "$src" "$dst_dir"
     fi
 
-    local chunk_idx=0 chunk_total=${#PACKER_CHUNKS[@]}
+    local chunk_idx=$PACKER_NEXT_CHUNK_IDX chunk_total=${#PACKER_CHUNKS[@]}
     local group
     for group in "${PACKER_CHUNKS[@]}"; do
         chunk_idx=$((chunk_idx + 1))
@@ -836,11 +933,13 @@ run_tar_chunk_pipeline() {
         if ! Packer::build_local_tar "$local_mnt" "$chunk_tar" "${items[@]}"; then
             Diagnostics::halt_chunk_pipeline "LOCAL_TAR_CREATE" "tar failed while building $chunk_tar" "$chunk_tar" "$local_mnt" "$src" "$dst_dir"
         fi
+        Diagnostics::mark_phase "$chunk_idx" "$chunk_total" "BUILT" "$chunk_tar"
 
         log_info "[CHUNK ${chunk_idx}/${chunk_total}] Verifying local archive integrity..."
         if ! Packer::verify_local_tar "$chunk_tar"; then
             Diagnostics::halt_chunk_pipeline "LOCAL_TAR_VERIFY" "Local archive failed tar -tf integrity check: $chunk_tar" "$chunk_tar" "$local_mnt" "$src" "$dst_dir"
         fi
+        Diagnostics::mark_phase "$chunk_idx" "$chunk_total" "VERIFIED_LOCAL" "$chunk_tar"
 
         if [ -n "$DRY_RUN_FLAG" ]; then
             log_info "[DRY-RUN][CHUNK ${chunk_idx}/${chunk_total}] Local archive validated. Skipping remote push, source purge, and buffer flush."
@@ -852,11 +951,20 @@ run_tar_chunk_pipeline() {
         if ! Transfer::resumable_push "$chunk_tar" "$dst_dir"; then
             Diagnostics::halt_chunk_pipeline "REMOTE_COPY" "rclone copy failed pushing $chunk_tar to $dst_dir" "$chunk_tar" "$local_mnt" "$src" "$dst_dir"
         fi
+        Diagnostics::mark_phase "$chunk_idx" "$chunk_total" "PUSHED" "$chunk_tar"
 
         log_info "[CHUNK ${chunk_idx}/${chunk_total}] Verifying remote copy integrity..."
         local verify_err
         if ! verify_err=$(Transfer::verify_remote_mass "$chunk_tar" "$dst_dir"); then
             Diagnostics::halt_chunk_pipeline "REMOTE_VERIFY" "$verify_err" "$chunk_tar" "$local_mnt" "$src" "$dst_dir"
+        fi
+        Diagnostics::mark_phase "$chunk_idx" "$chunk_total" "VERIFIED_REMOTE" "$chunk_tar"
+
+        # Claim this index on the remote before purge/flush, so a crash
+        # anywhere after this point can never cause a future run to
+        # re-issue a destination filename that already exists.
+        if ! Packer::persist_chunk_idx "$chunk_idx"; then
+            Diagnostics::halt_chunk_pipeline "STATE_PERSIST" "Failed to persist chunk index $chunk_idx to $PACKER_STATE_FILE" "$chunk_tar" "$local_mnt" "$src" "$dst_dir"
         fi
 
         if [ "$PACKER_PURGE_ON_SUCCESS" == "yes" ]; then
@@ -865,14 +973,17 @@ run_tar_chunk_pipeline() {
             if ! purge_err=$(Transfer::purge_source_manifest "$src" "${items[@]}"); then
                 Diagnostics::halt_chunk_pipeline "SOURCE_PURGE" "$purge_err" "$chunk_tar" "$local_mnt" "$src" "$dst_dir"
             fi
+            Diagnostics::mark_phase "$chunk_idx" "$chunk_total" "PURGED" "$chunk_tar"
         fi
 
         log_info "[CHUNK ${chunk_idx}/${chunk_total}] Flushing local exchange buffer..."
         rm -f "$chunk_tar"
+        Diagnostics::mark_phase "$chunk_idx" "$chunk_total" "FLUSHED" "$chunk_tar"
     done
 
     fusermount -u "$local_mnt" 2>/dev/null || true
     rmdir "$local_mnt" 2>/dev/null || true
+    CURRENT_MOUNT_DIR=""
     log_info "All ${chunk_total} chunk(s) for $src processed successfully."
 }
 
@@ -894,10 +1005,12 @@ while Queue::pop; do
 
         local_mnt=$(mktemp -d)
         rclone mount "$src" "$local_mnt" --daemon --allow-non-empty
+        CURRENT_MOUNT_DIR="$local_mnt"
         tar cvf - -C "$local_mnt" . | rclone rcat "$dst" $PACER_FLAGS --progress $DRY_RUN_FLAG
         pipe_status=("${PIPESTATUS[@]}")
         fusermount -u "$local_mnt" 2>/dev/null || true
         rmdir "$local_mnt" 2>/dev/null || true
+        CURRENT_MOUNT_DIR=""
 
         if [ "${pipe_status[0]}" -ne 0 ] || [ "${pipe_status[1]}" -ne 0 ]; then
             log_err "FATAL: TAR streaming pipeline failed for $src (tar=${pipe_status[0]}, rcat=${pipe_status[1]})"
