@@ -64,6 +64,7 @@ The script is a single self-contained Bash file with no external dependencies be
 - Greedy bin-packs the file manifest into archives no larger than a configurable `chunk_bytes` limit (e.g. `50G`, `500M`, or a raw byte count).
 - Per chunk: build a local tar from a FUSE-mounted view of the source → verify local archive integrity → push with `rclone copy` → verify the remote copy's size → purge only the source files that made it into that chunk → flush the local buffer.
 - Fails safe: any error at any stage halts the entire pipeline immediately (`Diagnostics::halt_chunk_pipeline`), leaving the local buffer, remaining source data, and destination untouched for manual inspection — it never silently skips ahead.
+- Crash-safe resume: chunk numbering is persisted per source+destination task, so an interrupted run picks back up at the correct next index instead of resetting to `part001` and risking an overwrite of already-completed chunks. If no state file exists yet, it self-heals by probing the destination for the highest existing chunk already there.
 - Dry-run aware: chunks are still built and locally verified for a realistic preview, but remote push, verification, purge, and buffer flush are skipped.
 - Useful for very large or deeply nested folders where a single unified TAR archive (see TAR mode above) would be impractical to build, push, or recover from if interrupted.
 
@@ -80,6 +81,11 @@ The script is a single self-contained Bash file with no external dependencies be
 - RAW mode: purge fires only after `rclone check` passes with zero errors.
 - TAR-CHUNK mode: purge is incremental — only the source files inside a chunk are deleted, and only after that chunk's remote copy is verified.
 - Source is never touched if any verification step fails.
+
+### Durable Execution Log & Crash-Safety Trap
+- Every run writes a timestamped log (`logs/`, next to the script) in addition to the usual stderr output, so a crash's full history survives even if the terminal/screen session that launched it dies without its own logging enabled.
+- TAR-CHUNK mode records a phase marker per chunk (`BUILT` / `VERIFIED_LOCAL` / `PUSHED` / `VERIFIED_REMOTE` / `PURGED` / `FLUSHED`), so the log alone shows exactly which stage a crash landed in.
+- A trap on `EXIT`/`INT`/`TERM`/`HUP` unmounts any live FUSE mount and logs the last known stage on any catchable termination. Best-effort only — it cannot catch `SIGKILL` or an OOM-kill.
 
 ### Dry-Run Simulation Mode
 - Runs the entire queue with rclone's `--dry-run` flag so no data is copied, archived, moved, or deleted on any remote.
@@ -205,13 +211,24 @@ The execution core applies conservative API pacing flags by default to avoid hit
 
 Adjust `PACER_FLAGS` in the script if your remotes support higher throughput or have different rate limits.
 
+A separate, more conservative pacing profile applies to every call against a Dropbox source remote — the TAR-CHUNK manifest scan, the purge loop, and the interactive setup's folder listings and payload size check — since Dropbox's API rate limits are noticeably tighter than Google Drive's in practice:
+
+```
+--tpslimit 4
+--low-level-retries 10
+```
+
+Adjust `DROPBOX_PACER_FLAGS` in the script if needed.
+
 ---
 
 ## Changelog
 
 Version history and a description of what changed in each release lives in [CHANGELOG.md](CHANGELOG.md).
 
-**Current version: 4.1.1** — fixes `Transfer::resumable_push()` silently discarding `rclone copy`'s exit status; a failed chunk push now halts the TAR-CHUNK pipeline immediately instead of relying solely on the downstream remote size check.
+**Current version: 4.2** — adds a durable execution log and per-chunk phase markers, a crash-safety trap (`EXIT`/`INT`/`TERM`/`HUP`) that unmounts any live FUSE mount and records the last known stage on unexpected termination, a persisted/self-healing chunk index so TAR-CHUNK mode resumes numbering correctly after a restart instead of risking an overwrite of already-completed chunks, and Dropbox-side API pacing across both the execution and interactive-setup phases.
+
+**v4.1.1** — fixes `Transfer::resumable_push()` silently discarding `rclone copy`'s exit status; a failed chunk push now halts the TAR-CHUNK pipeline immediately instead of relying solely on the downstream remote size check.
 
 **v4.1** — enforces strict white-list input validation on the profile choice, engine action, purge confirmation, and folder drill-down prompts, so stray characters (empty input, carriage returns, Cyrillic look-alikes, etc.) are rejected and re-prompted instead of silently defaulting.
 

@@ -2,6 +2,17 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [4.2] - 2026-07-08 to 2026-07-09
+
+### Added
+- Durable execution log (`logs/`, one file per run, next to the script) — `log_info`/`log_warn`/`log_err` and `Diagnostics::halt_chunk_pipeline`'s halt banner now persist to disk in addition to stderr, and a new `Diagnostics::mark_phase()` records a per-chunk phase marker (`BUILT`/`VERIFIED_LOCAL`/`PUSHED`/`VERIFIED_REMOTE`/`PURGED`/`FLUSHED`) so a crash's exact stage is visible from the log alone, without manual forensics.
+- Crash-safety trap (`EXIT`/`INT`/`TERM`/`HUP`) — unmounts any live FUSE mount and logs the last known stage on any catchable termination. Best-effort only: cannot catch `SIGKILL`/OOM.
+- Persisted, monotonic chunk index for TAR-CHUNK mode — `Packer::init` now scopes a small state file (`state/`, next to the script) by source+destination, so a restart continues chunk numbering from where it left off instead of resetting to `part001` and silently overwriting already-completed chunks on the remote. Self-heals when no state file exists yet (first run under this tracking, or a lost state file) by probing the destination for the highest existing chunk already there.
+- `DROPBOX_PACER_FLAGS` — pacing (`--tpslimit`, `--low-level-retries`) applied to every rclone call against the Dropbox source remote: the TAR-CHUNK manifest scan and purge loop, and the three interactive-setup calls (top-level folder listing, sub-folder drilldown, payload size check) that previously had none.
+
+### Fixed
+- `Packer::persist_chunk_idx` is now wrapped in the same `if ! ...; then halt...; fi` pattern as every other stage in the chunk loop, so a failed state-file write halts with a proper diagnosed banner instead of a bare `set -e` abort.
+
 ## [4.1.1] - 2026-07-07
 
 ### Fixed
