@@ -226,7 +226,9 @@ Adjust `DROPBOX_PACER_FLAGS` in the script if needed.
 
 Version history and a description of what changed in each release lives in [CHANGELOG.md](CHANGELOG.md).
 
-**Current version: 4.2.1** — extends the crash-safety trap's stage tracking to RAW and TAR modes (previously only TAR-CHUNK updated it, so a crash during a RAW/TAR task could misreport a stale stage), and fixes RAW mode's `rclone copy` call having no failure guard at all — a failed copy now logs cleanly and moves to the next queue item instead of triggering a bare `set -e` abort.
+**Current version: 4.2.2** — documentation-only release, adds the `TODO` section below tracking planned future work; no script behavior changes.
+
+**v4.2.1** — extends the crash-safety trap's stage tracking to RAW and TAR modes (previously only TAR-CHUNK updated it, so a crash during a RAW/TAR task could misreport a stale stage), and fixes RAW mode's `rclone copy` call having no failure guard at all — a failed copy now logs cleanly and moves to the next queue item instead of triggering a bare `set -e` abort.
 
 **v4.2** — adds a durable execution log and per-chunk phase markers, a crash-safety trap (`EXIT`/`INT`/`TERM`/`HUP`) that unmounts any live FUSE mount and records the last known stage on unexpected termination, a persisted/self-healing chunk index so TAR-CHUNK mode resumes numbering correctly after a restart instead of risking an overwrite of already-completed chunks, and Dropbox-side API pacing across both the execution and interactive-setup phases.
 
@@ -235,6 +237,14 @@ Version history and a description of what changed in each release lives in [CHAN
 **v4.1** — enforces strict white-list input validation on the profile choice, engine action, purge confirmation, and folder drill-down prompts, so stray characters (empty input, carriage returns, Cyrillic look-alikes, etc.) are rejected and re-prompted instead of silently defaulting.
 
 **v4.0** — adds TAR-CHUNK mode (recursive scan, size-bounded local archives, incremental per-chunk purge), refactors the queue/execution engine into `Core::QueueManager` / `Engine::ChunkPacker` / `Engine::CloudTransfer` / `System::Diagnostics` namespaces, and switches RAW mode from `rclone sync` to `rclone copy` so overlapping destination paths are never destructively deleted.
+
+---
+
+## TODO
+
+- **Test coverage** for the pure-logic functions that don't touch the network — `Packer::generate_chunks`' bin-packing, `format_bytes`, `prompt_strict_choice`'s validation, the chunk-index state-file parsing — via a lightweight framework like `bats-core`. Full end-to-end coverage of the live `rclone`/FUSE flows isn't the goal here; that would need either extensive mocking or real remotes in CI. Note: `bats-core` would be a new dependency, not yet approved.
+- Apply `PACER_FLAGS`-style pacing to the remaining unpaced destination-remote (Google Drive) listing calls in interactive setup (`select_dst_path`'s directory browsing) — lower priority than the Dropbox-side fixes since Drive hasn't shown any actual throttling.
+- TAR-CHUNK mode's persisted chunk index (v4.2) only fixes destination-filename collisions on resume; it doesn't make manifest bin-packing itself resume-aware, so the exact chunk *grouping* after an interrupted run may differ from what an uninterrupted run would have produced.
 
 ---
 

@@ -2,6 +2,13 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [4.2.2] - 2026-07-09
+
+### Added
+- `TODO` section in README.md tracking planned future work: test coverage for the pure-logic functions (bin-packing, byte formatting, input validation, chunk-index state parsing) via `bats-core`, pacing for the remaining unpaced Drive-side setup listing calls, and making TAR-CHUNK's bin-packing itself resume-aware (today's fix only prevents destination-filename collisions, not manifest re-grouping after a restart).
+
+Documentation-only release; no script behavior changes.
+
 ## [4.2.1] - 2026-07-09
 
 ### Fixed
