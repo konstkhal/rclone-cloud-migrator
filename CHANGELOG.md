@@ -2,6 +2,11 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [4.3.0] - 2026-07-09/10
+
+### Added
+- `Core::RemoteLock` — a second, cross-machine lock layered on top of v4.2.5's local `flock`: before starting each queued task, the script writes a lock object to `.rclone-cloud-migrator-locks/<task_key>.lock` at the root of both the source and destination remotes (outside the migrated path itself, so it's never picked up by `Packer::scan_payload`'s recursive listing). The local `flock` only protects against a second instance on the same host; this catches a second instance launched from a *different* machine against the same remote — the gap the local lock can't cover. Not a true distributed lock (check-then-write isn't atomic on most rclone backends), so it narrows the race rather than closing it. A remote that can't be listed/written to for locking purposes (read-only creds, quota, etc.) is skipped with a warning rather than treated as fatal; only an actually-existing lock object halts the run. Staleness is deliberately manual-only — a lock left behind by a crash blocks future runs until removed by hand, consistent with this script's existing halt-and-let-the-operator-decide philosophy, rather than an auto-expiry heuristic that a merely-slow run could also trip.
+
 ## [4.2.5] - 2026-07-09
 
 ### Added
