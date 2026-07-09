@@ -694,6 +694,15 @@ Diagnostics::mark_phase() {
     log_info "[CHUNK ${chunk_idx}/${chunk_total}] PHASE=${stage} tar=${chunk_tar}"
 }
 
+# Same purpose as Diagnostics::mark_phase, for the non-chunked RAW/TAR
+# modes' task-level (not per-chunk) lifecycle, so cleanup_on_exit reports
+# the correct last-known stage for every mode, not just TAR-CHUNK.
+Diagnostics::mark_task_phase() {
+    local mode="$1" stage="$2" path="$3"
+    CURRENT_STAGE="${mode^^}:${stage}"
+    log_info "[${mode^^}] PHASE=${stage} path=${path}"
+}
+
 # ---------------------------------------------------------------------------
 # Engine::ChunkPacker — turns one source tree into a sequence of size-bounded
 # local tar chunks. Bash has no object instances, so the "properties" below
@@ -1004,6 +1013,7 @@ while Queue::pop; do
     echo -e "\n----------------------------------------------------------------------"
     log_info "CRITICAL ENGAGEMENT: Starting deployment of $src"
     echo "----------------------------------------------------------------------"
+    Diagnostics::mark_task_phase "$mode" "STARTED" "$src"
 
     if [ "$mode" == "tar" ]; then
         log_info "Profile selected: STREAM TAR MODE. Mounting FUSE endpoint and piping..."
@@ -1011,6 +1021,7 @@ while Queue::pop; do
         local_mnt=$(mktemp -d)
         rclone mount "$src" "$local_mnt" --daemon --allow-non-empty
         CURRENT_MOUNT_DIR="$local_mnt"
+        Diagnostics::mark_task_phase "tar" "MOUNTED" "$src"
         tar cvf - -C "$local_mnt" . | rclone rcat "$dst" $PACER_FLAGS --progress $DRY_RUN_FLAG
         pipe_status=("${PIPESTATUS[@]}")
         fusermount -u "$local_mnt" 2>/dev/null || true
@@ -1021,6 +1032,7 @@ while Queue::pop; do
             log_err "FATAL: TAR streaming pipeline failed for $src (tar=${pipe_status[0]}, rcat=${pipe_status[1]})"
             continue
         fi
+        Diagnostics::mark_task_phase "tar" "STREAMED" "$dst"
 
         if [ -n "$DRY_RUN_FLAG" ]; then
             log_info "[DRY-RUN] Simulation complete for $dst. No archive was written; skipping verification and purge."
@@ -1031,9 +1043,11 @@ while Queue::pop; do
         tar_size=$(rclone lsf --format s "$dst" 2>/dev/null | head -1)
         if [[ "$tar_size" =~ ^[0-9]+$ ]] && [ "$tar_size" -gt 0 ]; then
             log_info "Container verification successful. Archive size: ${tar_size} bytes."
+            Diagnostics::mark_task_phase "tar" "VERIFIED" "$dst"
             if [ "$purge" == "yes" ]; then
                 log_warn "Purge rule triggered. Erasing source from source node: $src"
                 rclone purge "$src"
+                Diagnostics::mark_task_phase "tar" "PURGED" "$src"
             fi
         else
             log_err "FATAL: Archive verification failed for $dst — file missing or zero-byte."
@@ -1043,7 +1057,11 @@ while Queue::pop; do
         log_info "Profile selected: RAW DIRECT COPY MODE (non-destructive; rclone copy only)."
         # Never rclone sync here: sync deletes destination files that don't exist
         # in the source, which is unacceptable when target paths can overlap.
-        rclone copy "$src" "$dst" --progress --buffer-size 32M $PACER_FLAGS --transfers 4 --checkers 4 $DRY_RUN_FLAG
+        if ! rclone copy "$src" "$dst" --progress --buffer-size 32M $PACER_FLAGS --transfers 4 --checkers 4 $DRY_RUN_FLAG; then
+            log_err "FATAL: rclone copy failed for $src -> $dst"
+            continue
+        fi
+        Diagnostics::mark_task_phase "raw" "PUSHED" "$dst"
 
         if [ -n "$DRY_RUN_FLAG" ]; then
             log_info "[DRY-RUN] Simulation complete for $dst. No data was changed; skipping integrity check and purge."
@@ -1053,9 +1071,11 @@ while Queue::pop; do
         log_info "Launching deep hash check validation matrix..."
         if rclone check "$src" "$dst" --checkers 4 --tpslimit 8; then
             log_info "Integrity matrix verified. Data matches."
+            Diagnostics::mark_task_phase "raw" "VERIFIED" "$dst"
             if [ "$purge" == "yes" ]; then
                 log_warn "Purge rule triggered. Erasing source directory: $src"
                 rclone purge "$src"
+                Diagnostics::mark_task_phase "raw" "PURGED" "$src"
             fi
         else
             log_err "FATAL: Hash validation failed for $src. Purge bypassed to secure integrity."
