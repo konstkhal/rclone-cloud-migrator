@@ -2,6 +2,11 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [4.3.1] - 2026-07-10
+
+### Added
+- `TODO` entry documenting an alternative `Core::RemoteLock` design: one canonical, synced system-wide lock-state file instead of independent per-remote lock objects. Documentation-only release; no script behavior changes.
+
 ## [4.3.0] - 2026-07-09/10
 
 ### Added
