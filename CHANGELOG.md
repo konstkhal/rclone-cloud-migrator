@@ -2,6 +2,11 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [4.2.5] - 2026-07-09
+
+### Added
+- Single-instance guard: the script now acquires an exclusive `flock` on `state/.migrator.lock` before doing anything else, and exits immediately if another instance already holds it. Uses `flock` (tied to the process's file descriptor) rather than a PID file, so the lock is released automatically on any exit — including a crash or `SIGKILL` — with no stale-lock cleanup needed. Prevents two concurrent runs from racing on the same chunk-index state file or source manifest.
+
 ## [4.2.4] - 2026-07-09
 
 ### Fixed
