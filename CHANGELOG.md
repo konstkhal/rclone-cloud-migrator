@@ -2,6 +2,12 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [4.2.3] - 2026-07-09
+
+### Fixed
+- The Source Size Assessment Matrix (`rclone size --json` during interactive setup) could crash the whole script: if the call ultimately failed and returned nothing, the downstream `bytes_count`/`objects_count` parsing wasn't guarded like the `rclone` call itself, so `pipefail`'s propagated grep-no-match triggered an uncaught `set -e` abort instead of falling back to "Unknown" (which `format_bytes` and the display line already supported).
+- That same call's `rclone` stderr was discarded to `/dev/null`, so a failure here left no diagnostic trail at all — unlike everywhere else covered by the v4.2 durable log. Its stderr now appends to the durable log instead.
+
 ## [4.2.2] - 2026-07-09
 
 ### Added

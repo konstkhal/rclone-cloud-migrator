@@ -226,7 +226,9 @@ Adjust `DROPBOX_PACER_FLAGS` in the script if needed.
 
 Version history and a description of what changed in each release lives in [CHANGELOG.md](CHANGELOG.md).
 
-**Current version: 4.2.2** — documentation-only release, adds the `TODO` section below tracking planned future work; no script behavior changes.
+**Current version: 4.2.3** — fixes a crash in the Source Size Assessment Matrix (`rclone size --json` during interactive setup): a failed size check previously fell through to an unguarded parsing step that could trigger an uncaught `set -e` abort instead of falling back to "Unknown", and that call's `rclone` stderr is now captured into the durable log instead of discarded, so a future failure there is diagnosable.
+
+**v4.2.2** — documentation-only release, adds the `TODO` section below tracking planned future work; no script behavior changes.
 
 **v4.2.1** — extends the crash-safety trap's stage tracking to RAW and TAR modes (previously only TAR-CHUNK updated it, so a crash during a RAW/TAR task could misreport a stale stage), and fixes RAW mode's `rclone copy` call having no failure guard at all — a failed copy now logs cleanly and moves to the next queue item instead of triggering a bare `set -e` abort.
 
