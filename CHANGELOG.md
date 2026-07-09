@@ -2,6 +2,11 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [4.2.4] - 2026-07-09
+
+### Fixed
+- `Transfer::purge_source_manifest()` deleted each source file with its own standalone `rclone deletefile` process call, in a loop with a hardcoded 0.25s sleep between items. On a live TAR-CHUNK run this made purge the dominant cost of each chunk cycle (~45-55 min for a ~1700-item chunk) even though the actual API deletes were fast — the cost was ~1s of process/backend-init overhead paid over and over, plus the sleep. It also meant `DROPBOX_PACER_FLAGS`'s `--tpslimit` was being reset on every single invocation instead of pacing against one shared budget. Replaced the loop with one `rclone delete --files-from <manifest>` call per chunk, so the whole manifest purges through rclone's normal concurrent checkers/transfers in a single process.
+
 ## [4.2.3] - 2026-07-09
 
 ### Fixed

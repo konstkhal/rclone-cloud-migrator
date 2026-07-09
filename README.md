@@ -226,7 +226,9 @@ Adjust `DROPBOX_PACER_FLAGS` in the script if needed.
 
 Version history and a description of what changed in each release lives in [CHANGELOG.md](CHANGELOG.md).
 
-**Current version: 4.2.3** — fixes a crash in the Source Size Assessment Matrix (`rclone size --json` during interactive setup): a failed size check previously fell through to an unguarded parsing step that could trigger an uncaught `set -e` abort instead of falling back to "Unknown", and that call's `rclone` stderr is now captured into the durable log instead of discarded, so a future failure there is diagnosable.
+**Current version: 4.2.4** — fixes TAR-CHUNK mode's purge step: it used to delete each source file with its own standalone `rclone deletefile` process call in a loop (plus a hardcoded 0.25s sleep per item), which made purge the dominant cost of every chunk cycle on large manifests even though the actual deletes were fast. Now one `rclone delete --files-from` call purges the whole chunk's manifest per cycle.
+
+**v4.2.3** — fixes a crash in the Source Size Assessment Matrix (`rclone size --json` during interactive setup): a failed size check previously fell through to an unguarded parsing step that could trigger an uncaught `set -e` abort instead of falling back to "Unknown", and that call's `rclone` stderr is now captured into the durable log instead of discarded, so a future failure there is diagnosable.
 
 **v4.2.2** — documentation-only release, adds the `TODO` section below tracking planned future work; no script behavior changes.
 

@@ -5,7 +5,7 @@
 # ==============================================================================
 # Description: On-the-fly streaming tar-archiver and raw copy tool with queue.
 # Framework: Modular pseudoclass-style Bash CLI (Core/Engine/System namespaces).
-# Version: 4.2.3
+# Version: 4.2.4
 # ==============================================================================
 
 set -eo pipefail
@@ -876,18 +876,28 @@ Transfer::verify_remote_mass() {
 # Deletes only the specific source files packed into the chunk just
 # verified — never a directory-level purge — so an interrupted run never
 # loses more than what already has a confirmed remote copy.
+#
+# One `rclone delete --files-from` call for the whole manifest, not a
+# per-item `rclone deletefile` loop: each standalone rclone invocation costs
+# ~1s of process/backend-init overhead regardless of the actual API call, so
+# a 1000+ item chunk turned purge into the dominant cost of the pipeline.
+# --files-from also lets $DROPBOX_PACER_FLAGS's --tpslimit apply against one
+# shared token bucket instead of resetting on every process spawn.
 Transfer::purge_source_manifest() {
     local src_root="$1"
     shift
     local -a items=("$@")
-    local item
-    for item in "${items[@]}"; do
-        if ! rclone deletefile "${src_root%/}/${item}" $DROPBOX_PACER_FLAGS 2>/dev/null; then
-            echo "Failed to delete processed source item: ${src_root%/}/${item}"
-            return 1
-        fi
-        sleep 0.25
-    done
+    local manifest
+    manifest=$(mktemp) || { echo "Failed to create purge manifest tempfile"; return 1; }
+    printf '%s\n' "${items[@]}" > "$manifest"
+
+    local err_output
+    if ! err_output=$(rclone delete "${src_root%/}" --files-from "$manifest" $DROPBOX_PACER_FLAGS 2>&1); then
+        rm -f "$manifest"
+        echo "Failed to purge processed source items: ${err_output}"
+        return 1
+    fi
+    rm -f "$manifest"
 }
 
 # Incremental Local Buffer & Chunk-Based Purge Pipeline (TAR-CHUNK mode).
