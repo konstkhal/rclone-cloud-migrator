@@ -5,7 +5,7 @@
 # ==============================================================================
 # Description: On-the-fly streaming tar-archiver and raw copy tool with queue.
 # Framework: Modular pseudoclass-style Bash CLI (Core/Engine/System namespaces).
-# Version: 4.2.5
+# Version: 4.3.0
 # ==============================================================================
 
 set -eo pipefail
@@ -63,6 +63,9 @@ cleanup_on_exit() {
     if [ -n "$CURRENT_MOUNT_DIR" ] && mountpoint -q "$CURRENT_MOUNT_DIR" 2>/dev/null; then
         fusermount -u "$CURRENT_MOUNT_DIR" 2>/dev/null || true
         rmdir "$CURRENT_MOUNT_DIR" 2>/dev/null || true
+    fi
+    if declare -F RemoteLock::release_all >/dev/null && [ "${#REMOTE_LOCK_HELD[@]}" -gt 0 ]; then
+        RemoteLock::release_all
     fi
     if [ "$CONTROLLED_HALT" -eq 0 ] && { [ "$exit_code" -ne 0 ] || [ -n "$TRAP_SIGNAL" ]; }; then
         log_err "process terminated unexpectedly at stage: ${CURRENT_STAGE} (exit=${exit_code}${TRAP_SIGNAL:+, signal=$TRAP_SIGNAL})"
@@ -727,6 +730,14 @@ Diagnostics::mark_task_phase() {
 #
 # Properties: source_path, buffer_path, max_chunk_size, purge_on_success.
 # ---------------------------------------------------------------------------
+
+# Shared by the chunk-index state file below and Core::RemoteLock further
+# down, so both scope to the exact same source+destination identity.
+Core::task_key() {
+    local key="${1}__${2}"
+    printf '%s' "${key//[^A-Za-z0-9._-]/_}"
+}
+
 PACKER_SOURCE_PATH=""
 PACKER_BUFFER_PATH=""
 PACKER_MAX_CHUNK_SIZE=0
@@ -755,8 +766,8 @@ Packer::init() {
 
     local state_dir="${SCRIPT_DIR}/state"
     mkdir -p "$state_dir" 2>/dev/null || true
-    local task_key="${PACKER_SOURCE_PATH}__${dst_dir}"
-    task_key="${task_key//[^A-Za-z0-9._-]/_}"
+    local task_key
+    task_key=$(Core::task_key "$PACKER_SOURCE_PATH" "$dst_dir")
     PACKER_STATE_FILE="${state_dir}/.chunk_idx__${task_key}.state"
 
     if [ -f "$PACKER_STATE_FILE" ]; then
@@ -845,6 +856,102 @@ Packer::build_local_tar() {
 Packer::verify_local_tar() {
     local chunk_tar="$1"
     tar -tf "$chunk_tar" > /dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Core::RemoteLock — best-effort, non-atomic lock objects written to a
+# dedicated dotdir at the root of each of a task's remotes, scoped by the
+# same task_key as the chunk-index state file. Layered on top of the local
+# flock guard at the top of this script: the local lock is instant and
+# airtight but only protects against a second instance on the SAME host —
+# this is the only thing that can catch a second instance launched from a
+# different machine against the same remote.
+#
+# NOT a real distributed lock: checking for an existing lock object and
+# then writing one isn't atomic on most rclone backends (no compare-and-set
+# primitive), so this narrows the race window rather than closing it.
+#
+# The lock dir is deliberately outside every task's own source path (never
+# e.g. "$src/.lock") — Packer::scan_payload recursively lists the entire
+# source path, and a lock file living inside it would get packed into a
+# chunk and then purged like any other payload file.
+#
+# A remote this process can't list/write to (read-only creds, no quota,
+# etc.) is skipped with a warning rather than treated as fatal — refusing
+# to migrate at all over a side-channel lock permission issue would be
+# worse than the narrow race it guards against. Only an actual existing
+# lock object halts the run. Staleness is deliberately manual-only, same
+# as this script's other halt-and-let-the-operator-decide points: a lock
+# left behind by a crash blocks future runs until removed by hand, rather
+# than auto-expiring on a heartbeat that a merely-slow (not dead) run could
+# also miss.
+#
+# Locks acquired are held for the lifetime of the whole script process
+# (released together in cleanup_on_exit), not per-task — simpler than
+# threading a release call through every per-task success/failure/continue
+# path, and it has the side benefit of also protecting already-completed
+# tasks from a conflicting concurrent run for as long as this process
+# is up.
+# ---------------------------------------------------------------------------
+REMOTE_LOCK_DIRNAME=".rclone-cloud-migrator-locks"
+declare -a REMOTE_LOCK_HELD=()
+
+RemoteLock::_try_one() {
+    local remote_root="$1" task_key="$2"
+    local lock_dir="${remote_root}${REMOTE_LOCK_DIRNAME}/"
+    local lock_path="${lock_dir}${task_key}.lock"
+
+    # Relies on `rclone lsf` treating a not-yet-existing lock_dir as an
+    # empty listing (exit 0), not an error — true for Dropbox and Drive
+    # (the only two backends this script targets: both are prefix-based,
+    # so listing a nonexistent prefix just yields zero matches) but not
+    # guaranteed for every rclone backend. A backend that instead errors
+    # on a missing directory would misclassify "first run, dir doesn't
+    # exist yet" as "no access" below and permanently skip remote locking
+    # for that remote.
+    local listing
+    if ! listing=$(rclone lsf "$lock_dir" 2>/dev/null); then
+        log_warn "Could not list ${lock_dir} (no access, or it doesn't exist yet) — skipping remote lock on ${remote_root}."
+        return 0
+    fi
+
+    if printf '%s\n' "$listing" | grep -qxF "${task_key}.lock"; then
+        log_err "Remote lock already present at ${lock_path} — another instance may already be running this task (possibly from a different machine). If you're certain none is active (e.g. after a crash), delete that file manually and re-run."
+        return 1
+    fi
+
+    if ! printf 'host=%s pid=%s started=%s\n' "$(hostname)" "$$" "$(date -Iseconds)" | rclone rcat "$lock_path" 2>/dev/null; then
+        log_warn "Could not write remote lock at ${lock_path} (no write access?) — skipping remote lock on ${remote_root}."
+        return 0
+    fi
+
+    REMOTE_LOCK_HELD+=("$lock_path")
+    return 0
+}
+
+RemoteLock::acquire() {
+    local src="$1" dst="$2"
+    local task_key
+    task_key=$(Core::task_key "$src" "$dst")
+    local src_root="${src%%:*}:" dst_root="${dst%%:*}:"
+
+    RemoteLock::_try_one "$src_root" "$task_key" || return 1
+    if [ "$dst_root" != "$src_root" ]; then
+        RemoteLock::_try_one "$dst_root" "$task_key" || return 1
+    fi
+
+    if [ "${#REMOTE_LOCK_HELD[@]}" -eq 0 ]; then
+        log_warn "No remote-side lock could be established for '$src' (source and destination both unwritable/unlistable for locking) — relying on the local flock only. A second instance launched from a different machine would not be detected."
+    fi
+    return 0
+}
+
+RemoteLock::release_all() {
+    local p
+    for p in "${REMOTE_LOCK_HELD[@]}"; do
+        rclone deletefile "$p" 2>/dev/null || true
+    done
+    REMOTE_LOCK_HELD=()
 }
 
 # ---------------------------------------------------------------------------
@@ -1037,6 +1144,13 @@ while Queue::pop; do
     echo -e "\n----------------------------------------------------------------------"
     log_info "CRITICAL ENGAGEMENT: Starting deployment of $src"
     echo "----------------------------------------------------------------------"
+
+    if ! RemoteLock::acquire "$src" "$dst"; then
+        CONTROLLED_HALT=1
+        log_err "Halting: refusing to start '$src' due to a conflicting remote lock (see above)."
+        exit 1
+    fi
+
     Diagnostics::mark_task_phase "$mode" "STARTED" "$src"
 
     if [ "$mode" == "tar" ]; then

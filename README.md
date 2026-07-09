@@ -87,6 +87,10 @@ The script is a single self-contained Bash file with no external dependencies be
 - TAR-CHUNK mode records a phase marker per chunk (`BUILT` / `VERIFIED_LOCAL` / `PUSHED` / `VERIFIED_REMOTE` / `PURGED` / `FLUSHED`), so the log alone shows exactly which stage a crash landed in.
 - A trap on `EXIT`/`INT`/`TERM`/`HUP` unmounts any live FUSE mount and logs the last known stage on any catchable termination. Best-effort only — it cannot catch `SIGKILL` or an OOM-kill.
 
+### Concurrency Safety
+- Local guard: an exclusive `flock` on `state/.migrator.lock`, acquired before anything else runs. A second launch on the same host exits immediately instead of racing the first. Tied to the process's file descriptor, so it releases automatically on any exit, including a crash — no stale-lock cleanup needed.
+- Cross-machine guard: before each queued task, a lock object is written to `.rclone-cloud-migrator-locks/<task_key>.lock` at the root of both the source and destination remotes — the only thing that can catch a second instance launched from a *different* machine against the same remote, which the local `flock` can't see. Not a true atomic distributed lock (check-then-write isn't atomic on most rclone backends); a remote that can't be listed/written to for locking is skipped with a warning rather than failing the run. Staleness is manual-only — a lock left behind by a crash needs to be deleted by hand rather than auto-expiring.
+
 ### Dry-Run Simulation Mode
 - Runs the entire queue with rclone's `--dry-run` flag so no data is copied, archived, moved, or deleted on any remote.
 - **Interactive prompt (default):** on every run without `-d`/`--dry-run`, the script asks `Would you like to perform a safe dry-run (simulation) first? [Y/n]` before touching any remote. Pressing Enter or `y` starts a simulation; `n` confirms LIVE mode.
@@ -226,7 +230,9 @@ Adjust `DROPBOX_PACER_FLAGS` in the script if needed.
 
 Version history and a description of what changed in each release lives in [CHANGELOG.md](CHANGELOG.md).
 
-**Current version: 4.2.5** — adds a single-instance guard: the script now acquires an exclusive `flock` on `state/.migrator.lock` before doing anything else, and exits immediately if another instance already holds it, preventing two concurrent runs from racing on the same chunk-index state file or source manifest. Uses `flock` rather than a PID file so the lock releases automatically on any exit, including a crash.
+**Current version: 4.3.0** — adds a cross-machine lock layered on top of v4.2.5's local one: before each queued task, the script writes a lock object to `.rclone-cloud-migrator-locks/<task_key>.lock` at the root of both the source and destination remotes, catching a second instance launched from a *different* machine (which the local `flock` can't see). Not a true atomic distributed lock, and a remote that can't be listed/written to for locking is skipped with a warning rather than failing the run; only an actually-existing lock object halts. Staleness is manual-only — a lock left behind by a crash needs to be deleted by hand.
+
+**v4.2.5** — adds a single-instance guard: the script now acquires an exclusive `flock` on `state/.migrator.lock` before doing anything else, and exits immediately if another instance already holds it, preventing two concurrent runs from racing on the same chunk-index state file or source manifest. Uses `flock` rather than a PID file so the lock releases automatically on any exit, including a crash.
 
 **v4.2.4** — fixes TAR-CHUNK mode's purge step: it used to delete each source file with its own standalone `rclone deletefile` process call in a loop (plus a hardcoded 0.25s sleep per item), which made purge the dominant cost of every chunk cycle on large manifests even though the actual deletes were fast. Now one `rclone delete --files-from` call purges the whole chunk's manifest per cycle.
 
