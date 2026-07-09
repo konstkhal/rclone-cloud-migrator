@@ -2,6 +2,12 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [4.2.1] - 2026-07-09
+
+### Fixed
+- The crash-safety trap's `CURRENT_STAGE` tracking was only ever updated inside the TAR-CHUNK pipeline, so an uncaught crash during a RAW or TAR task would misreport whatever stage a prior TAR-CHUNK task had left behind. Adds `Diagnostics::mark_task_phase()`, the non-chunked counterpart to `mark_phase()`, with call sites at each mount/push/verify/purge transition in both modes.
+- RAW mode's `rclone copy` call had no failure guard at all, unlike every other remote operation in the script — a failed copy would trigger a bare `set -e` abort instead of a clean logged failure and continue to the next queue item.
+
 ## [4.2] - 2026-07-08 to 2026-07-09
 
 ### Added

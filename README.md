@@ -226,7 +226,9 @@ Adjust `DROPBOX_PACER_FLAGS` in the script if needed.
 
 Version history and a description of what changed in each release lives in [CHANGELOG.md](CHANGELOG.md).
 
-**Current version: 4.2** — adds a durable execution log and per-chunk phase markers, a crash-safety trap (`EXIT`/`INT`/`TERM`/`HUP`) that unmounts any live FUSE mount and records the last known stage on unexpected termination, a persisted/self-healing chunk index so TAR-CHUNK mode resumes numbering correctly after a restart instead of risking an overwrite of already-completed chunks, and Dropbox-side API pacing across both the execution and interactive-setup phases.
+**Current version: 4.2.1** — extends the crash-safety trap's stage tracking to RAW and TAR modes (previously only TAR-CHUNK updated it, so a crash during a RAW/TAR task could misreport a stale stage), and fixes RAW mode's `rclone copy` call having no failure guard at all — a failed copy now logs cleanly and moves to the next queue item instead of triggering a bare `set -e` abort.
+
+**v4.2** — adds a durable execution log and per-chunk phase markers, a crash-safety trap (`EXIT`/`INT`/`TERM`/`HUP`) that unmounts any live FUSE mount and records the last known stage on unexpected termination, a persisted/self-healing chunk index so TAR-CHUNK mode resumes numbering correctly after a restart instead of risking an overwrite of already-completed chunks, and Dropbox-side API pacing across both the execution and interactive-setup phases.
 
 **v4.1.1** — fixes `Transfer::resumable_push()` silently discarding `rclone copy`'s exit status; a failed chunk push now halts the TAR-CHUNK pipeline immediately instead of relying solely on the downstream remote size check.
 
