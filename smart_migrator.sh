@@ -490,9 +490,9 @@ configure_queue() {
             # Source Size Assessment Matrix
             log_info "Calculating source directory payload mass..."
             local size_json bytes_count objects_count human_size
-            size_json=$(rclone size --json "${GLOBAL_SRC_REMOTE}${target_folder}" $DROPBOX_PACER_FLAGS 2>/dev/null) || true
-            bytes_count=$(echo "$size_json" | grep -o '"bytes":[0-9]*' | cut -d: -f2)
-            objects_count=$(echo "$size_json" | grep -o '"count":[0-9]*' | cut -d: -f2)
+            size_json=$(rclone size --json "${GLOBAL_SRC_REMOTE}${target_folder}" $DROPBOX_PACER_FLAGS 2>>"$LOG_FILE") || true
+            bytes_count=$(echo "$size_json" | grep -o '"bytes":[0-9]*' | cut -d: -f2) || true
+            objects_count=$(echo "$size_json" | grep -o '"count":[0-9]*' | cut -d: -f2) || true
             human_size=$(format_bytes "$bytes_count")
 
             echo "----------------------------------------------------------------------"
