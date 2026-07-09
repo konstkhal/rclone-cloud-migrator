@@ -5,7 +5,7 @@
 # ==============================================================================
 # Description: On-the-fly streaming tar-archiver and raw copy tool with queue.
 # Framework: Modular pseudoclass-style Bash CLI (Core/Engine/System namespaces).
-# Version: 4.2.4
+# Version: 4.2.5
 # ==============================================================================
 
 set -eo pipefail
@@ -33,6 +33,20 @@ _log_persist() { printf '%s\n' "$1" >> "$LOG_FILE" 2>/dev/null || true; }
 log_info() { echo -e "[\033[0;32mINFO\033[0m] $1" >&2; _log_persist "$(date '+%F %T') [INFO] $1"; }
 log_warn() { echo -e "[\033[0;33mWARN\033[0m] $1" >&2; _log_persist "$(date '+%F %T') [WARN] $1"; }
 log_err()  { echo -e "[\033[0;31mERROR\033[0m] $1" >&2; _log_persist "$(date '+%F %T') [ERROR] $1"; }
+
+# Single-instance guard. flock (not a PID file) so a crash of any kind
+# (including SIGKILL/OOM) releases the lock automatically when fd 200
+# closes, instead of leaving a stale lock behind that needs manual
+# cleanup or PID-liveness checking. Must run before anything that
+# touches the source/destination remotes or local state, so two
+# concurrent launches can never race on the same chunk-index state file.
+LOCK_FILE="${SCRIPT_DIR}/state/.migrator.lock"
+mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
+exec 200>"$LOCK_FILE"
+if ! flock -n 200; then
+    log_err "Another instance of smart_migrator.sh is already running (lock held on $LOCK_FILE). Exiting."
+    exit 1
+fi
 
 # CONTROLLED_HALT lets a deliberate, fully-diagnosed halt
 # (Diagnostics::halt_chunk_pipeline) suppress cleanup_on_exit's generic
