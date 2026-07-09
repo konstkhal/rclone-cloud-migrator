@@ -10,6 +10,12 @@
 
 set -eo pipefail
 
+# Applied to every rclone call against the Dropbox source remote, both
+# during interactive setup (folder listings, payload size checks) and
+# execution (manifest scan, purge loop) — defined this early so it's in
+# scope everywhere, not just the functions defined later in the file.
+DROPBOX_PACER_FLAGS="--tpslimit 4 --low-level-retries 10"
+
 # ---------------------------------------------------------------------------
 # System::Diagnostics — logging primitives, durable execution log, and the
 # crash-safety trap. Defined first since every other module calls into these.
@@ -316,7 +322,7 @@ select_dst_path() {
 
 # 5. Fetch Top-Level Structures from Source
 log_info "Fetching top-level directories from $GLOBAL_SRC_REMOTE..."
-TOP_FOLDERS=$(rclone lsf --dirs-only --dir-slash=false "$GLOBAL_SRC_REMOTE")
+TOP_FOLDERS=$(rclone lsf --dirs-only --dir-slash=false "$GLOBAL_SRC_REMOTE" $DROPBOX_PACER_FLAGS)
 
 # ---------------------------------------------------------------------------
 # Core::QueueManager — owns the pending job list. Tasks are stored as
@@ -439,7 +445,7 @@ configure_queue() {
                 drill_opt=$(prompt_strict_choice "Drill down deeper into this directory? (y/n): " "yYnN" "y or n")
                 if [[ "$drill_opt" == "y" || "$drill_opt" == "Y" ]]; then
                     local sub_listing
-                    sub_listing=$(rclone lsf --dirs-only --dir-slash=false "${GLOBAL_SRC_REMOTE}${target_folder}" 2>/dev/null) || true
+                    sub_listing=$(rclone lsf --dirs-only --dir-slash=false "${GLOBAL_SRC_REMOTE}${target_folder}" $DROPBOX_PACER_FLAGS 2>/dev/null) || true
                     if [ -z "$sub_listing" ]; then
                         log_warn "No subfolders found under '$target_folder'. Using this path as-is."
                         break
@@ -484,7 +490,7 @@ configure_queue() {
             # Source Size Assessment Matrix
             log_info "Calculating source directory payload mass..."
             local size_json bytes_count objects_count human_size
-            size_json=$(rclone size --json "${GLOBAL_SRC_REMOTE}${target_folder}" 2>/dev/null) || true
+            size_json=$(rclone size --json "${GLOBAL_SRC_REMOTE}${target_folder}" $DROPBOX_PACER_FLAGS 2>/dev/null) || true
             bytes_count=$(echo "$size_json" | grep -o '"bytes":[0-9]*' | cut -d: -f2)
             objects_count=$(echo "$size_json" | grep -o '"count":[0-9]*' | cut -d: -f2)
             human_size=$(format_bytes "$bytes_count")
@@ -646,7 +652,6 @@ done
 log_info "Initializing pipeline engines. Total jobs in pool: $(Queue::size)"
 
 PACER_FLAGS="--drive-pacer-burst 1 --drive-pacer-min-sleep 100ms --tpslimit 10 --low-level-retries 15"
-DROPBOX_PACER_FLAGS="--tpslimit 4 --low-level-retries 10"
 
 # ---------------------------------------------------------------------------
 # System::Diagnostics (continued) — transactional abort handler for the
