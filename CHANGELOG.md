@@ -2,6 +2,14 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [4.5.0] - 2026-07-10
+
+### Changed
+- `DROPBOX_PURGE_REMOTE` (v4.4.0, a single optional dedicated remote for purge) generalized to `DROPBOX_PURGE_REMOTES` — a space-separated list of one or more dedicated Dropbox remotes. When more than one is listed, a chunk's purge manifest is split round-robin across all of them and purged concurrently, one background `rclone delete` process per remote, each against its own independently-authorized rate-limit budget (per Dropbox's per-authorization rate-limit model). A single-remote list, or the empty default (falls back to the primary source remote), behaves identically to the previous one-process-one-call shape. Verified in isolation against a fake rclone stand-in: correct fallback when unset, correct single-remote routing, and an even, no-duplicate, no-loss round-robin split across 3 remotes with an uneven (7-item) manifest.
+
+### TODO
+- Added a README `TODO` entry: generalize dedicated-remote assignment beyond just purge — let a role (list / read / sync / purge / copy / etc.) be assigned per configured remote synonym, so any operation type could be distributed across multiple independently-authorized apps, not only deletes.
+
 ## [4.4.0] - 2026-07-10
 
 ### Added
