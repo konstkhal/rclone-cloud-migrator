@@ -230,7 +230,9 @@ Adjust `DROPBOX_PACER_FLAGS` in the script if needed.
 
 Version history and a description of what changed in each release lives in [CHANGELOG.md](CHANGELOG.md).
 
-**Current version: 4.3.1** — documentation-only: adds a `TODO` entry for an alternative `Core::RemoteLock` design (a single synced system-wide lock-state file instead of independent per-remote lock objects); no script behavior changes.
+**Current version: 4.3.2** — fixes a real regression in v4.2.4's batched purge: it was missing `--no-traverse`, so `rclone delete --files-from` did a full recursive listing of the *entire* remaining source tree on every chunk instead of a targeted per-file lookup — confirmed live to be slower (62m9s) than the per-file loop it replaced (~45-55 min). Adding `--no-traverse` (rclone's own documented recommendation for a small manifest against a much larger tree) eliminates the full-tree scan.
+
+**v4.3.1** — documentation-only: adds a `TODO` entry for an alternative `Core::RemoteLock` design (a single synced system-wide lock-state file instead of independent per-remote lock objects); no script behavior changes.
 
 **v4.3.0** — adds a cross-machine lock layered on top of v4.2.5's local one: before each queued task, the script writes a lock object to `.rclone-cloud-migrator-locks/<task_key>.lock` at the root of both the source and destination remotes, catching a second instance launched from a *different* machine (which the local `flock` can't see). Not a true atomic distributed lock, and a remote that can't be listed/written to for locking is skipped with a warning rather than failing the run; only an actually-existing lock object halts. Staleness is manual-only — a lock left behind by a crash needs to be deleted by hand.
 

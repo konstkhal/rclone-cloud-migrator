@@ -5,7 +5,7 @@
 # ==============================================================================
 # Description: On-the-fly streaming tar-archiver and raw copy tool with queue.
 # Framework: Modular pseudoclass-style Bash CLI (Core/Engine/System namespaces).
-# Version: 4.3.1
+# Version: 4.3.2
 # ==============================================================================
 
 set -eo pipefail
@@ -1004,6 +1004,17 @@ Transfer::verify_remote_mass() {
 # a 1000+ item chunk turned purge into the dominant cost of the pipeline.
 # --files-from also lets $DROPBOX_PACER_FLAGS's --tpslimit apply against one
 # shared token bucket instead of resetting on every process spawn.
+#
+# --no-traverse is required here, not optional: without it, `rclone delete
+# --files-from` does a full recursive listing of the ENTIRE remaining
+# source tree and filters it down to the manifest (confirmed via -vv: every
+# non-matching top-level entry logged as "Excluded") — cost scales with
+# total remaining tree size, not chunk size, and only gets relatively more
+# expensive as the migration progresses and purges an ever-smaller
+# fraction of what's left. --no-traverse switches this to a direct,
+# targeted lookup per listed file instead, which is rclone's own
+# documented recommendation for exactly this shape of case: a small
+# manifest (~1-2k files) against a much larger tree (100k+ objects).
 Transfer::purge_source_manifest() {
     local src_root="$1"
     shift
@@ -1013,7 +1024,7 @@ Transfer::purge_source_manifest() {
     printf '%s\n' "${items[@]}" > "$manifest"
 
     local err_output
-    if ! err_output=$(rclone delete "${src_root%/}" --files-from "$manifest" $DROPBOX_PACER_FLAGS 2>&1); then
+    if ! err_output=$(rclone delete "${src_root%/}" --files-from "$manifest" --no-traverse $DROPBOX_PACER_FLAGS 2>&1); then
         rm -f "$manifest"
         echo "Failed to purge processed source items: ${err_output}"
         return 1
