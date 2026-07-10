@@ -2,6 +2,11 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [4.3.2] - 2026-07-10
+
+### Fixed
+- `Transfer::purge_source_manifest()`'s v4.2.4 batched `rclone delete --files-from` call was missing `--no-traverse`, which made it *slower* than the per-file loop it replaced: confirmed live on a real chunk purge (62m9s, vs. ~45-55 min under the old code) and diagnosed via `-vv --dry-run`, `--files-from` without `--no-traverse` does a full recursive listing of the entire remaining source tree and filters it down to the manifest — cost scales with total remaining tree size (345K+ objects), not chunk size (~1-2k files), and gets relatively worse as the migration progresses and purges an ever-smaller fraction of what's left. `--no-traverse` switches this to a direct, targeted per-file lookup instead — confirmed via the same `-vv --dry-run` trace to eliminate the full-tree scan entirely. This is rclone's own documented recommendation for a small manifest against a much larger tree, which is exactly this script's TAR-CHUNK purge shape.
+
 ## [4.3.1] - 2026-07-10
 
 ### Added
