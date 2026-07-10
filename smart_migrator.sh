@@ -5,7 +5,7 @@
 # ==============================================================================
 # Description: On-the-fly streaming tar-archiver and raw copy tool with queue.
 # Framework: Modular pseudoclass-style Bash CLI (Core/Engine/System namespaces).
-# Version: 4.3.2
+# Version: 4.3.3
 # ==============================================================================
 
 set -eo pipefail
@@ -901,23 +901,32 @@ RemoteLock::_try_one() {
     local lock_dir="${remote_root}${REMOTE_LOCK_DIRNAME}/"
     local lock_path="${lock_dir}${task_key}.lock"
 
-    # Relies on `rclone lsf` treating a not-yet-existing lock_dir as an
-    # empty listing (exit 0), not an error — true for Dropbox and Drive
-    # (the only two backends this script targets: both are prefix-based,
-    # so listing a nonexistent prefix just yields zero matches) but not
-    # guaranteed for every rclone backend. A backend that instead errors
-    # on a missing directory would misclassify "first run, dir doesn't
-    # exist yet" as "no access" below and permanently skip remote locking
-    # for that remote.
+    # Originally assumed `rclone lsf` on a not-yet-existing lock_dir would
+    # return an empty listing (exit 0), not an error, on both Dropbox and
+    # Drive (prefix-based backends, no real directories to be "missing").
+    # Confirmed wrong live on 2026-07-10: lsf errored on a first-ever run
+    # against both remotes, which under the old logic here meant treating
+    # "doesn't exist yet" the same as "no access" and permanently skipping
+    # remote locking — the lock dir was never created, so every future run
+    # hit the exact same listing failure forever.
+    #
+    # Fix: a listing failure is no longer treated as fatal-to-this-remote
+    # on its own. It just means the pre-write conflict check is skipped
+    # (can't positively rule out a pre-existing lock), and control falls
+    # through to attempting the write, whose own success/failure is a more
+    # reliable access signal than the list's — a first-run write creates
+    # the lock dir implicitly and succeeds; a genuine permissions problem
+    # fails the write too, which IS handled below. The accepted gap: a
+    # listing failure caused by something other than "doesn't exist yet"
+    # (a transient network error, say) could miss a real conflicting lock.
+    # That's on top of the non-atomicity already noted in the module
+    # header — this lock was never meant to be airtight.
     local listing
-    if ! listing=$(rclone lsf "$lock_dir" 2>/dev/null); then
-        log_warn "Could not list ${lock_dir} (no access, or it doesn't exist yet) — skipping remote lock on ${remote_root}."
-        return 0
-    fi
-
-    if printf '%s\n' "$listing" | grep -qxF "${task_key}.lock"; then
-        log_err "Remote lock already present at ${lock_path} — another instance may already be running this task (possibly from a different machine). If you're certain none is active (e.g. after a crash), delete that file manually and re-run."
-        return 1
+    if listing=$(rclone lsf "$lock_dir" 2>/dev/null); then
+        if printf '%s\n' "$listing" | grep -qxF "${task_key}.lock"; then
+            log_err "Remote lock already present at ${lock_path} — another instance may already be running this task (possibly from a different machine). If you're certain none is active (e.g. after a crash), delete that file manually and re-run."
+            return 1
+        fi
     fi
 
     if ! printf 'host=%s pid=%s started=%s\n' "$(hostname)" "$$" "$(date -Iseconds)" | rclone rcat "$lock_path" 2>/dev/null; then

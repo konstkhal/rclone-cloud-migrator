@@ -230,7 +230,9 @@ Adjust `DROPBOX_PACER_FLAGS` in the script if needed.
 
 Version history and a description of what changed in each release lives in [CHANGELOG.md](CHANGELOG.md).
 
-**Current version: 4.3.2** — fixes a real regression in v4.2.4's batched purge: it was missing `--no-traverse`, so `rclone delete --files-from` did a full recursive listing of the *entire* remaining source tree on every chunk instead of a targeted per-file lookup — confirmed live to be slower (62m9s) than the per-file loop it replaced (~45-55 min). Adding `--no-traverse` (rclone's own documented recommendation for a small manifest against a much larger tree) eliminates the full-tree scan.
+**Current version: 4.3.3** — fixes `Core::RemoteLock`'s first-run assumption: `rclone lsf` on the not-yet-existing lock directory was assumed to return an empty listing on Dropbox/Drive, but actually errors (`directory not found`) on both — confirmed live, meaning the lock directory was never created and remote locking silently never activated on any first run. A listing failure no longer blocks that remote outright; it falls through to attempting the write instead, whose own result now decides whether that remote's lock is skipped.
+
+**v4.3.2** — fixes a real regression in v4.2.4's batched purge: it was missing `--no-traverse`, so `rclone delete --files-from` did a full recursive listing of the *entire* remaining source tree on every chunk instead of a targeted per-file lookup — confirmed live to be slower (62m9s) than the per-file loop it replaced (~45-55 min). Adding `--no-traverse` (rclone's own documented recommendation for a small manifest against a much larger tree) eliminates the full-tree scan.
 
 **v4.3.1** — documentation-only: adds a `TODO` entry for an alternative `Core::RemoteLock` design (a single synced system-wide lock-state file instead of independent per-remote lock objects); no script behavior changes.
 

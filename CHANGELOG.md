@@ -2,6 +2,11 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [4.3.3] - 2026-07-10
+
+### Fixed
+- `Core::RemoteLock`'s first-run assumption was wrong: `rclone lsf` on the not-yet-existing `.rclone-cloud-migrator-locks/` directory was assumed to return an empty listing on both Dropbox and Drive (prefix-based backends, no real "missing directory" concept) — confirmed live that it actually errors (`directory not found`) on both. Under the old logic this meant "doesn't exist yet" was indistinguishable from "no access," so the lock directory was never created and remote locking silently never activated on any first run. A listing failure is no longer treated as fatal to that remote on its own — it just skips the pre-write conflict check and falls through to attempting the write, whose own success/failure is what now determines whether that remote's lock is skipped. Also surfaced, incidentally: the source Dropbox account appears to be near its storage quota (`path/insufficient_space` on a few-byte write) — the only write-to-Dropbox operation anywhere in this script is this lock file, so it's new exposure from v4.3.0 specifically, not a risk to the existing read/delete pipeline; source-side remote locking will simply stay unavailable (falls back to the local flock) until Dropbox has free space again.
+
 ## [4.3.2] - 2026-07-10
 
 ### Fixed
