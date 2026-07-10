@@ -224,13 +224,17 @@ A separate, more conservative pacing profile applies to every call against a Dro
 
 Adjust `DROPBOX_PACER_FLAGS` in the script if needed.
 
+If purge duration becomes the dominant cost and looks like it's hitting Dropbox's real server-side throttling (not just `DROPBOX_PACER_FLAGS`'s own pacing), set `DROPBOX_PURGE_REMOTE` to a second rclone remote name (a separate Dropbox App Key authorized against the same account) to give purge's delete calls their own independent rate-limit budget, separate from the mount/scan/build traffic under the primary source remote. Unset by default.
+
 ---
 
 ## Changelog
 
 Version history and a description of what changed in each release lives in [CHANGELOG.md](CHANGELOG.md).
 
-**Current version: 4.3.3** — fixes `Core::RemoteLock`'s first-run assumption: `rclone lsf` on the not-yet-existing lock directory was assumed to return an empty listing on Dropbox/Drive, but actually errors (`directory not found`) on both — confirmed live, meaning the lock directory was never created and remote locking silently never activated on any first run. A listing failure no longer blocks that remote outright; it falls through to attempting the write instead, whose own result now decides whether that remote's lock is skipped.
+**Current version: 4.4.0** — adds an optional `DROPBOX_PURGE_REMOTE` setting to route purge's delete calls through a second, separately-authorized Dropbox app instead of the primary source remote. Live investigation found real purge durations (71-87 min for ~1700-2000 items) worse than every approach tried, with evidence pointing to cumulative server-side Dropbox throttling across the whole pipeline rather than anything about how the delete calls themselves are structured — per Dropbox's docs, a second app gets its own independent rate-limit budget. Unset by default; no behavior change unless configured.
+
+**v4.3.3** — fixes `Core::RemoteLock`'s first-run assumption: `rclone lsf` on the not-yet-existing lock directory was assumed to return an empty listing on Dropbox/Drive, but actually errors (`directory not found`) on both — confirmed live, meaning the lock directory was never created and remote locking silently never activated on any first run. A listing failure no longer blocks that remote outright; it falls through to attempting the write instead, whose own result now decides whether that remote's lock is skipped.
 
 **v4.3.2** — fixes a real regression in v4.2.4's batched purge: it was missing `--no-traverse`, so `rclone delete --files-from` did a full recursive listing of the *entire* remaining source tree on every chunk instead of a targeted per-file lookup — confirmed live to be slower (62m9s) than the per-file loop it replaced (~45-55 min). Adding `--no-traverse` (rclone's own documented recommendation for a small manifest against a much larger tree) eliminates the full-tree scan.
 

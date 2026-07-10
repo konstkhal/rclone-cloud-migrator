@@ -2,6 +2,11 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [4.4.0] - 2026-07-10
+
+### Added
+- `DROPBOX_PURGE_REMOTE` — optional dedicated Dropbox remote (a second App Key authorized against the same account) for purge's delete calls specifically. Live investigation on Tokyo found real purge durations (71-87 min for ~1700-2000 items) far exceeding both the old per-file loop and every batching attempt, with strong evidence (a single long-idle connection, unread data sitting in the receive buffer, minimal CPU across the whole elapsed time) pointing to real server-side Dropbox throttling triggered by *cumulative* API usage across the whole pipeline (mount reads + scan + purge), not anything specific to how the delete calls are issued. Per Dropbox's own docs, rate limits are enforced per-authorization and separate apps linked by the same user don't share a budget — so giving purge its own app keeps its request volume from competing with mount/scan/build traffic under the primary remote. Empty/unset by default; purge behaves exactly as before unless explicitly configured.
+
 ## [4.3.3] - 2026-07-10
 
 ### Fixed
