@@ -5,7 +5,7 @@
 # ==============================================================================
 # Description: On-the-fly streaming tar-archiver and raw copy tool with queue.
 # Framework: Modular pseudoclass-style Bash CLI (Core/Engine/System namespaces).
-# Version: 4.3.3
+# Version: 4.4.0
 # ==============================================================================
 
 set -eo pipefail
@@ -15,6 +15,18 @@ set -eo pipefail
 # execution (manifest scan, purge loop) — defined this early so it's in
 # scope everywhere, not just the functions defined later in the file.
 DROPBOX_PACER_FLAGS="--tpslimit 4 --low-level-retries 10"
+
+# Optional: dedicate a second Dropbox API app/token exclusively to purge's
+# delete calls, e.g. "dropboxPurge:" — the name of a second rclone remote
+# (a different Dropbox App Key authorized against the same account) to
+# purge through instead of the primary source remote. Per Dropbox's own
+# rate-limit docs, limits are enforced "per-authorization," and multiple
+# apps linked by the same user don't count against each other's limit —
+# so a second app gives purge its own independent budget instead of
+# competing with the mount/scan/build traffic that already runs under the
+# primary remote for the rest of the pipeline. Empty by default: purge
+# uses the same remote as everything else unless this is explicitly set.
+DROPBOX_PURGE_REMOTE=""
 
 # ---------------------------------------------------------------------------
 # System::Diagnostics — logging primitives, durable execution log, and the
@@ -1032,8 +1044,16 @@ Transfer::purge_source_manifest() {
     manifest=$(mktemp) || { echo "Failed to create purge manifest tempfile"; return 1; }
     printf '%s\n' "${items[@]}" > "$manifest"
 
+    # Swap in the dedicated purge remote's prefix (same underlying account,
+    # different app authorization) if configured, keeping the path portion
+    # unchanged — see DROPBOX_PURGE_REMOTE above.
+    local delete_target="${src_root%/}"
+    if [ -n "$DROPBOX_PURGE_REMOTE" ]; then
+        delete_target="${DROPBOX_PURGE_REMOTE}${delete_target#*:}"
+    fi
+
     local err_output
-    if ! err_output=$(rclone delete "${src_root%/}" --files-from "$manifest" --no-traverse $DROPBOX_PACER_FLAGS 2>&1); then
+    if ! err_output=$(rclone delete "$delete_target" --files-from "$manifest" --no-traverse $DROPBOX_PACER_FLAGS 2>&1); then
         rm -f "$manifest"
         echo "Failed to purge processed source items: ${err_output}"
         return 1
