@@ -5,7 +5,7 @@
 # ==============================================================================
 # Description: On-the-fly streaming tar-archiver and raw copy tool with queue.
 # Framework: Modular pseudoclass-style Bash CLI (Core/Engine/System namespaces).
-# Version: 4.4.0
+# Version: 4.5.0
 # ==============================================================================
 
 set -eo pipefail
@@ -16,17 +16,24 @@ set -eo pipefail
 # scope everywhere, not just the functions defined later in the file.
 DROPBOX_PACER_FLAGS="--tpslimit 4 --low-level-retries 10"
 
-# Optional: dedicate a second Dropbox API app/token exclusively to purge's
-# delete calls, e.g. "dropboxPurge:" — the name of a second rclone remote
-# (a different Dropbox App Key authorized against the same account) to
-# purge through instead of the primary source remote. Per Dropbox's own
-# rate-limit docs, limits are enforced "per-authorization," and multiple
-# apps linked by the same user don't count against each other's limit —
-# so a second app gives purge its own independent budget instead of
-# competing with the mount/scan/build traffic that already runs under the
-# primary remote for the rest of the pipeline. Empty by default: purge
-# uses the same remote as everything else unless this is explicitly set.
-DROPBOX_PURGE_REMOTE=""
+# Optional: dedicate one or more Dropbox API apps/tokens exclusively to
+# purge's delete calls, e.g. "dropboxPurge1: dropboxPurge2: dropboxPurge3:"
+# (space-separated remote names — different Dropbox App Keys, all
+# authorized against the same account). Per Dropbox's own rate-limit
+# docs, limits are enforced "per-authorization," and multiple apps
+# linked by the same user don't count against each other's limit — so
+# each remote listed here gets its own independent budget. A chunk's
+# purge manifest is split round-robin across every listed remote and
+# purged concurrently, one rclone process per remote.
+#
+# Empty by default: purge uses the primary source remote alone, exactly
+# as it always did. When non-empty, this list REPLACES the primary
+# remote for purge purposes rather than adding to it — the primary
+# remote keeps doing everything else (mount/scan/build), but purge
+# routes only through what's listed here. Include the primary remote's
+# own name in the list too if you want it to also share the purge load
+# instead of being fully offloaded to dedicated remotes.
+DROPBOX_PURGE_REMOTES=""
 
 # ---------------------------------------------------------------------------
 # System::Diagnostics — logging primitives, durable execution log, and the
@@ -1019,12 +1026,13 @@ Transfer::verify_remote_mass() {
 # verified — never a directory-level purge — so an interrupted run never
 # loses more than what already has a confirmed remote copy.
 #
-# One `rclone delete --files-from` call for the whole manifest, not a
-# per-item `rclone deletefile` loop: each standalone rclone invocation costs
-# ~1s of process/backend-init overhead regardless of the actual API call, so
-# a 1000+ item chunk turned purge into the dominant cost of the pipeline.
-# --files-from also lets $DROPBOX_PACER_FLAGS's --tpslimit apply against one
-# shared token bucket instead of resetting on every process spawn.
+# One `rclone delete --files-from` call per purge remote, not a per-item
+# `rclone deletefile` loop: each standalone rclone invocation costs ~1s of
+# process/backend-init overhead regardless of the actual API call, so a
+# 1000+ item chunk turned purge into the dominant cost of the pipeline.
+# --files-from also lets $DROPBOX_PACER_FLAGS's --tpslimit apply against
+# one shared token bucket per remote instead of resetting on every
+# process spawn.
 #
 # --no-traverse is required here, not optional: without it, `rclone delete
 # --files-from` does a full recursive listing of the ENTIRE remaining
@@ -1036,29 +1044,65 @@ Transfer::verify_remote_mass() {
 # targeted lookup per listed file instead, which is rclone's own
 # documented recommendation for exactly this shape of case: a small
 # manifest (~1-2k files) against a much larger tree (100k+ objects).
+#
+# When DROPBOX_PURGE_REMOTES lists more than one remote, the manifest is
+# split round-robin across all of them and purged concurrently — one
+# background rclone process per remote, each against its own
+# independently-authorized rate-limit budget. A single-remote list (or
+# the empty default, which falls back to the primary source remote)
+# degenerates to the same one-process-one-call shape as before.
 Transfer::purge_source_manifest() {
     local src_root="$1"
     shift
     local -a items=("$@")
-    local manifest
-    manifest=$(mktemp) || { echo "Failed to create purge manifest tempfile"; return 1; }
-    printf '%s\n' "${items[@]}" > "$manifest"
 
-    # Swap in the dedicated purge remote's prefix (same underlying account,
-    # different app authorization) if configured, keeping the path portion
-    # unchanged — see DROPBOX_PURGE_REMOTE above.
-    local delete_target="${src_root%/}"
-    if [ -n "$DROPBOX_PURGE_REMOTE" ]; then
-        delete_target="${DROPBOX_PURGE_REMOTE}${delete_target#*:}"
+    local path_only="${src_root%/}"
+    path_only="${path_only#*:}"
+
+    local -a purge_remotes=()
+    if [ -n "$DROPBOX_PURGE_REMOTES" ]; then
+        read -ra purge_remotes <<< "$DROPBOX_PURGE_REMOTES"
+    else
+        purge_remotes=("${src_root%%:*}:")
     fi
 
-    local err_output
-    if ! err_output=$(rclone delete "$delete_target" --files-from "$manifest" --no-traverse $DROPBOX_PACER_FLAGS 2>&1); then
-        rm -f "$manifest"
+    local n="${#purge_remotes[@]}"
+    local -a manifests=() outfiles=() pids=()
+    local i
+    for ((i = 0; i < n; i++)); do
+        manifests[i]=$(mktemp) || { echo "Failed to create purge manifest tempfile"; return 1; }
+        : > "${manifests[i]}"
+        outfiles[i]=$(mktemp) || { echo "Failed to create purge output tempfile"; return 1; }
+    done
+
+    # Round-robin item assignment keeps each remote's slice as even as
+    # possible regardless of how item count relates to remote count.
+    local idx=0 item
+    for item in "${items[@]}"; do
+        printf '%s\n' "$item" >> "${manifests[idx]}"
+        idx=$(( (idx + 1) % n ))
+    done
+
+    for ((i = 0; i < n; i++)); do
+        local delete_target="${purge_remotes[i]}${path_only}"
+        ( rclone delete "$delete_target" --files-from "${manifests[i]}" --no-traverse $DROPBOX_PACER_FLAGS > "${outfiles[i]}" 2>&1 ) &
+        pids[i]=$!
+    done
+
+    local overall_status=0 err_output=""
+    for ((i = 0; i < n; i++)); do
+        if ! wait "${pids[i]}"; then
+            overall_status=1
+            err_output+="[${purge_remotes[i]}] $(cat "${outfiles[i]}" 2>/dev/null) "
+        fi
+        rm -f "${manifests[i]}" "${outfiles[i]}"
+    done
+
+    if [ "$overall_status" -ne 0 ]; then
         echo "Failed to purge processed source items: ${err_output}"
         return 1
     fi
-    rm -f "$manifest"
+    return 0
 }
 
 # Incremental Local Buffer & Chunk-Based Purge Pipeline (TAR-CHUNK mode).
