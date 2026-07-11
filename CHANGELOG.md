@@ -2,6 +2,13 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [5.0.0] - 2026-07-11
+
+### Changed
+- **Async purge (`Core::AsyncPurger`)** — source purge no longer blocks the build/push pipeline. Live measurement showed purge as the dominant cycle cost (~70-110 min of server-side-throttled Dropbox deletes vs ~32 min build+push), running as a serial stage while the build machinery idled — and vice versa. Now, once a chunk is `PUSHED` + `VERIFIED_REMOTE` + its index persisted, its item list is written to a durable manifest under `state/pending_purge/` (new `PURGE_QUEUED` phase marker) and the pipeline moves straight to the next build; a single background purger consumes the queue concurrently and logs `PURGED (async)` per manifest. Expected effect: chunk cycle time drops to roughly build+push, and deletes get ~all wall-clock time instead of the gaps between builds.
+- Safety contract preserved: manifests are enqueued only after remote verification (never before), queue entries are atomic durable files that survive crashes and resume on relaunch, and a purge failure still halts the whole pipeline via a persisted failure flag — detected at the next chunk boundary rather than immediately. Retried manifests tolerate files already deleted by an earlier interrupted attempt (not-found errors are classified as success for the affected slice).
+- Version bumped to 5.0.0: first structural change to the TAR-CHUNK execution model since 4.0 (serial stage loop → producer/consumer split).
+
 ## [4.5.0] - 2026-07-10
 
 ### Changed

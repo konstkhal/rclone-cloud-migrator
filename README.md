@@ -62,7 +62,7 @@ The script is a single self-contained Bash file with no external dependencies be
 ### TAR-CHUNK Mode — Size-Bounded Local Archives with Incremental Purge
 - Recursively scans the full source tree (`rclone lsf -R`), however deeply nested, so no subdirectory is invisible to the packer.
 - Greedy bin-packs the file manifest into archives no larger than a configurable `chunk_bytes` limit (e.g. `50G`, `500M`, or a raw byte count).
-- Per chunk: build a local tar from a FUSE-mounted view of the source → verify local archive integrity → push with `rclone copy` → verify the remote copy's size → purge only the source files that made it into that chunk → flush the local buffer.
+- Per chunk: build a local tar from a FUSE-mounted view of the source → verify local archive integrity → push with `rclone copy` → verify the remote copy's size → queue the chunk's source files for async purge → flush the local buffer. A single background purger drains the queue concurrently with subsequent builds, so slow (rate-limited) source deletes never block the transfer pipeline; only the files inside a verified chunk are ever deleted.
 - Fails safe: any error at any stage halts the entire pipeline immediately (`Diagnostics::halt_chunk_pipeline`), leaving the local buffer, remaining source data, and destination untouched for manual inspection — it never silently skips ahead.
 - Crash-safe resume: chunk numbering is persisted per source+destination task, so an interrupted run picks back up at the correct next index instead of resetting to `part001` and risking an overwrite of already-completed chunks. If no state file exists yet, it self-heals by probing the destination for the highest existing chunk already there.
 - Dry-run aware: chunks are still built and locally verified for a realistic preview, but remote push, verification, purge, and buffer flush are skipped.
@@ -84,7 +84,7 @@ The script is a single self-contained Bash file with no external dependencies be
 
 ### Durable Execution Log & Crash-Safety Trap
 - Every run writes a timestamped log (`logs/`, next to the script) in addition to the usual stderr output, so a crash's full history survives even if the terminal/screen session that launched it dies without its own logging enabled.
-- TAR-CHUNK mode records a phase marker per chunk (`BUILT` / `VERIFIED_LOCAL` / `PUSHED` / `VERIFIED_REMOTE` / `PURGED` / `FLUSHED`), so the log alone shows exactly which stage a crash landed in.
+- TAR-CHUNK mode records a phase marker per chunk (`BUILT` / `VERIFIED_LOCAL` / `PUSHED` / `VERIFIED_REMOTE` / `PURGE_QUEUED` / `FLUSHED`, plus an asynchronous `PURGED` logged by the background purger when that chunk's deletes complete), so the log alone shows exactly which stage a crash landed in.
 - A trap on `EXIT`/`INT`/`TERM`/`HUP` unmounts any live FUSE mount and logs the last known stage on any catchable termination. Best-effort only — it cannot catch `SIGKILL` or an OOM-kill.
 
 ### Concurrency Safety
@@ -232,7 +232,9 @@ If purge duration becomes the dominant cost and looks like it's hitting Dropbox'
 
 Version history and a description of what changed in each release lives in [CHANGELOG.md](CHANGELOG.md).
 
-**Current version: 4.5.0** — generalizes v4.4.0's single dedicated purge remote into `DROPBOX_PURGE_REMOTES`, a list of one or more. When more than one is configured, a chunk's purge manifest is split round-robin across all of them and purged concurrently, one process per remote, each against its own independently-authorized rate-limit budget — instead of a single dedicated remote absorbing all of purge's request volume alone. A single-remote list (or the empty default) behaves exactly as v4.4.0 did.
+**Current version: 5.0.0** — decouples source purge from the transfer pipeline (`Core::AsyncPurger`): verified chunks' item lists are queued as durable manifests and deleted by a background purger concurrently with subsequent builds, instead of purge running as a blocking serial stage. Live measurement had shown purge (~70-110 min of server-throttled Dropbox deletes per chunk) dominating every cycle while build/push machinery idled. Crash-safe queue, same purge-only-after-verify guarantee, purge failures still halt the pipeline via a persisted flag.
+
+**v4.5.0** — generalizes v4.4.0's single dedicated purge remote into `DROPBOX_PURGE_REMOTES`, a list of one or more. When more than one is configured, a chunk's purge manifest is split round-robin across all of them and purged concurrently, one process per remote, each against its own independently-authorized rate-limit budget — instead of a single dedicated remote absorbing all of purge's request volume alone. A single-remote list (or the empty default) behaves exactly as v4.4.0 did.
 
 **v4.4.0** — adds an optional dedicated Dropbox remote setting to route purge's delete calls through a second, separately-authorized Dropbox app instead of the primary source remote. Live investigation found real purge durations (71-87 min for ~1700-2000 items) worse than every approach tried, with evidence pointing to cumulative server-side Dropbox throttling across the whole pipeline rather than anything about how the delete calls themselves are structured — per Dropbox's docs, a second app gets its own independent rate-limit budget. Unset by default; no behavior change unless configured.
 

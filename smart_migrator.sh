@@ -5,7 +5,7 @@
 # ==============================================================================
 # Description: On-the-fly streaming tar-archiver and raw copy tool with queue.
 # Framework: Modular pseudoclass-style Bash CLI (Core/Engine/System namespaces).
-# Version: 4.5.0
+# Version: 5.0.0
 # ==============================================================================
 
 set -eo pipefail
@@ -85,6 +85,11 @@ cleanup_on_exit() {
     fi
     if declare -F RemoteLock::release_all >/dev/null && [ "${#REMOTE_LOCK_HELD[@]}" -gt 0 ]; then
         RemoteLock::release_all
+    fi
+    # Stop the async purger if it's still running; its queue is durable
+    # files, so anything unfinished resumes on the next launch.
+    if [ -n "${PURGER_PID:-}" ] && kill -0 "$PURGER_PID" 2>/dev/null; then
+        kill "$PURGER_PID" 2>/dev/null || true
     fi
     if [ "$CONTROLLED_HALT" -eq 0 ] && { [ "$exit_code" -ne 0 ] || [ -n "$TRAP_SIGNAL" ]; }; then
         log_err "process terminated unexpectedly at stage: ${CURRENT_STAGE} (exit=${exit_code}${TRAP_SIGNAL:+, signal=$TRAP_SIGNAL})"
@@ -1092,8 +1097,20 @@ Transfer::purge_source_manifest() {
     local overall_status=0 err_output=""
     for ((i = 0; i < n; i++)); do
         if ! wait "${pids[i]}"; then
-            overall_status=1
-            err_output+="[${purge_remotes[i]}] $(cat "${outfiles[i]}" 2>/dev/null) "
+            # A manifest retried after an interrupted purge hits files the
+            # first attempt already deleted; rclone reports those as
+            # not-found errors and exits non-zero even though every file
+            # that still exists WAS deleted. That outcome is success for
+            # our purposes — only treat the slice as failed if any error
+            # line is something other than a not-found.
+            local real_errors
+            real_errors=$(grep -iE "ERROR" "${outfiles[i]}" 2>/dev/null | grep -ivE "not found|no such object|doesn'?t exist" || true)
+            if [ -n "$real_errors" ]; then
+                overall_status=1
+                err_output+="[${purge_remotes[i]}] $(cat "${outfiles[i]}" 2>/dev/null) "
+            else
+                log_warn "Purge slice on ${purge_remotes[i]} reported only not-found errors (files already deleted by an earlier interrupted attempt) — treating as success."
+            fi
         fi
         rm -f "${manifests[i]}" "${outfiles[i]}"
     done
@@ -1103,6 +1120,127 @@ Transfer::purge_source_manifest() {
         return 1
     fi
     return 0
+}
+
+# ---------------------------------------------------------------------------
+# Core::AsyncPurger — decouples source purge from the build/push pipeline.
+#
+# Purge was measured as the dominant cost of every chunk cycle (~70-110 min
+# of server-side-throttled deletes vs ~32 min build+push), and it ran as a
+# blocking stage while the build machinery sat idle — and vice versa. The
+# purger moves deletes into a single background worker consuming a durable
+# on-disk queue, so chunk N's purge runs WHILE chunk N+1 builds. Deletes
+# get ~all wall-clock time instead of the fraction between builds, and the
+# pipeline's cycle time drops to roughly build+push.
+#
+# Safety contract is unchanged from the synchronous design:
+#   - A manifest is enqueued only after PUSHED + VERIFIED_REMOTE +
+#     persist_chunk_idx — never before a chunk's remote copy is confirmed.
+#   - Queue entries are durable files (write-tmp-then-mv), so a crash loses
+#     nothing: pending manifests are picked up on the next launch, and
+#     retried slices tolerate already-deleted files (see above).
+#   - A purge failure still halts the whole pipeline — just detected at
+#     the next chunk boundary instead of immediately. The failure detail
+#     is persisted in a flag file the operator can inspect.
+# ---------------------------------------------------------------------------
+PURGER_PID=""
+PURGER_QUEUE_DIR=""
+PURGER_FAIL_FLAG=""
+PURGER_DONE_FLAG=""
+
+Purger::init() {
+    PURGER_QUEUE_DIR="${SCRIPT_DIR}/state/pending_purge"
+    PURGER_FAIL_FLAG="${SCRIPT_DIR}/state/.purge_failed"
+    PURGER_DONE_FLAG="${SCRIPT_DIR}/state/.purge_input_done"
+    mkdir -p "$PURGER_QUEUE_DIR" 2>/dev/null || true
+    rm -f "$PURGER_DONE_FLAG"
+
+    if [ -f "$PURGER_FAIL_FLAG" ]; then
+        log_warn "Previous run left a purge-failure flag: $(cat "$PURGER_FAIL_FLAG" 2>/dev/null)"
+        log_warn "Clearing it and retrying the still-pending purge manifests."
+        rm -f "$PURGER_FAIL_FLAG"
+    fi
+
+    # if-form, not `[ ] &&` — a bare failed test as the function's last
+    # command would propagate through set -e and kill the pipeline.
+    local pending
+    pending=$(find "$PURGER_QUEUE_DIR" -name '*.manifest' 2>/dev/null | wc -l)
+    if [ "$pending" -gt 0 ]; then
+        log_info "Async purger: ${pending} pending purge manifest(s) from a previous run will be processed first."
+    fi
+}
+
+# Manifest format: line 1 = source root, line 2 = "<idx>/<total>" for log
+# attribution, remaining lines = one relative file path each.
+Purger::enqueue() {
+    local src_root="$1" chunk_idx="$2" chunk_total="$3"
+    shift 3
+    local name tmp
+    name=$(printf 'part%05d.manifest' "$chunk_idx")
+    tmp="${PURGER_QUEUE_DIR}/.${name}.tmp"
+    {
+        printf '%s\n' "$src_root"
+        printf '%s/%s\n' "$chunk_idx" "$chunk_total"
+        printf '%s\n' "$@"
+    } > "$tmp" && mv "$tmp" "${PURGER_QUEUE_DIR}/${name}"
+}
+
+Purger::daemon_loop() {
+    local m src_root idx_total purge_err
+    while true; do
+        m=$(find "$PURGER_QUEUE_DIR" -name '*.manifest' 2>/dev/null | sort | head -1)
+        if [ -z "$m" ]; then
+            [ -f "$PURGER_DONE_FLAG" ] && return 0
+            sleep 5
+            continue
+        fi
+
+        src_root=$(head -1 "$m")
+        idx_total=$(sed -n '2p' "$m")
+        local -a items=()
+        mapfile -t items < <(tail -n +3 "$m")
+
+        log_warn "[CHUNK ${idx_total}] Async purge starting (${#items[@]} items)..."
+        if ! purge_err=$(Transfer::purge_source_manifest "$src_root" "${items[@]}"); then
+            printf 'ASYNC_PURGE failed on %s (chunk %s): %s\n' "$m" "$idx_total" "$purge_err" > "$PURGER_FAIL_FLAG"
+            log_err "Async purger halting: ${purge_err}"
+            return 1
+        fi
+        rm -f "$m"
+        log_info "[CHUNK ${idx_total}] PHASE=PURGED (async) manifest=${m##*/}"
+    done
+}
+
+Purger::start() {
+    Purger::daemon_loop &
+    PURGER_PID=$!
+    log_info "Async purger started (pid ${PURGER_PID})."
+}
+
+# Returns non-zero (with the failure detail on stdout) if the purger has
+# flagged a failure — called at each chunk boundary by the pipeline.
+Purger::check_failed() {
+    if [ -n "$PURGER_FAIL_FLAG" ] && [ -f "$PURGER_FAIL_FLAG" ]; then
+        cat "$PURGER_FAIL_FLAG" 2>/dev/null
+        return 1
+    fi
+    return 0
+}
+
+# Signal end-of-input and wait for the queue to drain.
+Purger::drain() {
+    [ -z "$PURGER_PID" ] && return 0
+    touch "$PURGER_DONE_FLAG"
+    local pending
+    pending=$(find "$PURGER_QUEUE_DIR" -name '*.manifest' 2>/dev/null | wc -l)
+    if [ "$pending" -gt 0 ]; then
+        log_info "All chunks pushed. Waiting for async purger to finish ${pending} remaining purge manifest(s)..."
+    fi
+    local rc=0
+    wait "$PURGER_PID" || rc=$?
+    PURGER_PID=""
+    rm -f "$PURGER_DONE_FLAG"
+    return "$rc"
 }
 
 # Incremental Local Buffer & Chunk-Based Purge Pipeline (TAR-CHUNK mode).
@@ -1130,6 +1268,11 @@ run_tar_chunk_pipeline() {
 
     Packer::generate_chunks
 
+    if [ "$PACKER_PURGE_ON_SUCCESS" == "yes" ] && [ -z "$DRY_RUN_FLAG" ]; then
+        Purger::init
+        Purger::start
+    fi
+
     log_info "Mounting FUSE endpoint for chunk assembly: $src"
     local local_mnt
     local_mnt=$(mktemp -d)
@@ -1154,6 +1297,11 @@ run_tar_chunk_pipeline() {
 
         local chunk_tar
         chunk_tar="${PACKER_BUFFER_PATH%/}/${folder_name}.part$(printf '%03d' "$chunk_idx").tar"
+
+        local purge_fail_detail
+        if ! purge_fail_detail=$(Purger::check_failed); then
+            Diagnostics::halt_chunk_pipeline "ASYNC_PURGE" "$purge_fail_detail" "" "$local_mnt" "$src" "$dst_dir"
+        fi
 
         echo "----------------------------------------------------------------------"
         log_info "[CHUNK ${chunk_idx}/${chunk_total}] Building local archive: $chunk_tar"
@@ -1197,12 +1345,11 @@ run_tar_chunk_pipeline() {
         fi
 
         if [ "$PACKER_PURGE_ON_SUCCESS" == "yes" ]; then
-            log_warn "[CHUNK ${chunk_idx}/${chunk_total}] Purge rule active. Removing processed source items..."
-            local purge_err
-            if ! purge_err=$(Transfer::purge_source_manifest "$src" "${items[@]}"); then
-                Diagnostics::halt_chunk_pipeline "SOURCE_PURGE" "$purge_err" "$chunk_tar" "$local_mnt" "$src" "$dst_dir"
+            log_warn "[CHUNK ${chunk_idx}/${chunk_total}] Purge rule active. Queueing source items for async purge..."
+            if ! Purger::enqueue "$src" "$chunk_idx" "$chunk_total" "${items[@]}"; then
+                Diagnostics::halt_chunk_pipeline "PURGE_ENQUEUE" "Failed to write purge manifest for chunk ${chunk_idx} to ${PURGER_QUEUE_DIR}" "$chunk_tar" "$local_mnt" "$src" "$dst_dir"
             fi
-            Diagnostics::mark_phase "$chunk_idx" "$chunk_total" "PURGED" "$chunk_tar"
+            Diagnostics::mark_phase "$chunk_idx" "$chunk_total" "PURGE_QUEUED" "$chunk_tar"
         fi
 
         log_info "[CHUNK ${chunk_idx}/${chunk_total}] Flushing local exchange buffer..."
@@ -1213,6 +1360,14 @@ run_tar_chunk_pipeline() {
     fusermount -u "$local_mnt" 2>/dev/null || true
     rmdir "$local_mnt" 2>/dev/null || true
     CURRENT_MOUNT_DIR=""
+
+    if [ "$PACKER_PURGE_ON_SUCCESS" == "yes" ] && [ -z "$DRY_RUN_FLAG" ]; then
+        local drain_fail_detail
+        if ! Purger::drain || ! drain_fail_detail=$(Purger::check_failed); then
+            Diagnostics::halt_chunk_pipeline "ASYNC_PURGE" "${drain_fail_detail:-$(cat "$PURGER_FAIL_FLAG" 2>/dev/null)}" "" "" "$src" "$dst_dir"
+        fi
+    fi
+
     log_info "All ${chunk_total} chunk(s) for $src processed successfully."
 }
 
