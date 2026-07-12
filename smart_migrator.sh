@@ -5,7 +5,7 @@
 # ==============================================================================
 # Description: On-the-fly streaming tar-archiver and raw copy tool with queue.
 # Framework: Modular pseudoclass-style Bash CLI (Core/Engine/System namespaces).
-# Version: 5.0.0
+# Version: 5.1.0
 # ==============================================================================
 
 set -eo pipefail
@@ -768,6 +768,7 @@ PACKER_MAX_CHUNK_SIZE=0
 PACKER_PURGE_ON_SUCCESS="no"
 PACKER_NEXT_CHUNK_IDX=0
 PACKER_STATE_FILE=""
+PACKER_DST_DIR=""
 
 declare -a PACKER_MANIFEST_PATHS=()
 declare -a PACKER_MANIFEST_SIZES=()
@@ -784,6 +785,7 @@ Packer::init() {
     PACKER_MAX_CHUNK_SIZE="$3"
     PACKER_PURGE_ON_SUCCESS="$4"
     local dst_dir="$5"
+    PACKER_DST_DIR="$dst_dir"
     PACKER_MANIFEST_PATHS=()
     PACKER_MANIFEST_SIZES=()
     PACKER_CHUNKS=()
@@ -825,20 +827,92 @@ Packer::persist_chunk_idx() {
     printf '%s\n' "$idx" > "$tmp" && mv "$tmp" "$PACKER_STATE_FILE"
 }
 
+# Resume-safety filter (async-purge crash recovery). Async purge (v5.0.0)
+# deletes source files far behind the build pipeline, so on a crash-resume
+# the live source still holds files for chunks already PUSHED + verified on
+# the destination whose purge is merely queued (state/pending_purge/*.manifest
+# still present). The count-based skip (PACKER_NEXT_CHUNK_IDX) assumes those
+# are gone; if they aren't, generate_chunks would re-bin and re-archive them
+# under fresh part numbers (duplication, corrupted numbering, and — if a
+# partially-purged chunk were rebuilt over its complete remote tar — data
+# loss). The queued purge manifests are a durable, order-independent record
+# of exactly those "pushed-but-still-present" files, so filtering the scan
+# against them by set membership leaves only genuinely un-archived files to
+# chunk. Files from already-purged chunks are gone from the source and never
+# appear in the scan, so they need no handling. Operates in place on the
+# tab-separated size\tpath scan file.
+Packer::apply_resume_filter() {
+    local scan_file="$1"
+    local queue_dir="${SCRIPT_DIR}/state/pending_purge"
+    [ -d "$queue_dir" ] || return 0
+    local -a manifests
+    shopt -s nullglob
+    manifests=("$queue_dir"/*.manifest)
+    shopt -u nullglob
+    [ ${#manifests[@]} -eq 0 ] && return 0
+
+    # Union of the queued manifests' file lists (line 1 is the src root and
+    # line 2 is "idx/total", so skip each manifest's two-line header).
+    local archived_set maxidx=0 m idx
+    archived_set=$(mktemp)
+    for m in "${manifests[@]}"; do tail -n +3 "$m" 2>/dev/null; done | sort -u > "$archived_set"
+
+    # Highest chunk number still queued — computed in its own loop, NOT in the
+    # pipe above, so the assignment survives in this shell (a piped loop body
+    # runs in a subshell and its variable writes are lost).
+    for m in "${manifests[@]}"; do
+        idx=$(sed -n '2p' "$m" 2>/dev/null); idx="${idx%%/*}"
+        [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -gt "$maxidx" ] && maxidx="$idx"
+    done
+
+    # Consistency guard: a queued (pushed-but-unpurged) chunk numbered higher
+    # than the persisted next-chunk index means the filter set and the resume
+    # counter disagree — a crash between the index write and the purge enqueue.
+    # Numbering the remainder from that stale index could overwrite a good
+    # remote tar, so halt rather than risk it.
+    if [ "$maxidx" -gt "$PACKER_NEXT_CHUNK_IDX" ]; then
+        rm -f "$archived_set"
+        Diagnostics::halt_chunk_pipeline "RESUME_INCONSISTENT" \
+            "Queued purge manifest chunk $maxidx is numbered higher than the persisted next-chunk index $PACKER_NEXT_CHUNK_IDX; refusing to resume to avoid mislabeling a chunk over an existing remote archive. Inspect state/pending_purge and the .chunk_idx state file." \
+            "" "" "$PACKER_SOURCE_PATH" "$PACKER_DST_DIR"
+    fi
+
+    local before after
+    before=$(wc -l < "$scan_file")
+    awk -F'\t' 'NR==FNR{a[$0]=1;next} !($2 in a)' "$archived_set" "$scan_file" > "${scan_file}.filtered"
+    mv "${scan_file}.filtered" "$scan_file"
+    after=$(wc -l < "$scan_file")
+    rm -f "$archived_set"
+    log_info "Resume filter: excluded $((before - after)) already-archived file(s) still queued for purge (chunks up to $maxidx); resuming after chunk $PACKER_NEXT_CHUNK_IDX."
+}
+
 # Builds a flat manifest of every file under source_path, however deeply
 # nested, via rclone's own recursive listing rather than a top-level-only
 # directory walk — this is what fixes the v3.0 bug where a single nested
-# directory holding hundreds of GiB was invisible to the bin-packer.
+# directory holding hundreds of GiB was invisible to the bin-packer. The
+# scan is materialized to a temp file so the resume-safety filter can run a
+# single set-membership pass over it before it becomes the in-memory manifest.
 Packer::scan_payload() {
     log_info "Deep-scanning full recursive file manifest under ${PACKER_SOURCE_PATH}..."
+    local scan_file
+    scan_file=$(mktemp)
+    # `|| true`: a non-zero rclone exit (e.g. a transient listing error near
+    # the end of a long recursive scan) must not abort the run under set -e —
+    # the previous process-substitution form masked rclone's exit code, and
+    # this direct redirect would otherwise expose it.
+    rclone lsf -R --files-only --format "sp" --separator $'\t' "$PACKER_SOURCE_PATH" $DROPBOX_PACER_FLAGS > "$scan_file" 2>/dev/null || true
+
+    Packer::apply_resume_filter "$scan_file"
+
     local size relpath
     while IFS=$'\t' read -r size relpath; do
         [ -z "$relpath" ] && continue
         [[ "$size" =~ ^[0-9]+$ ]] || size=0
         PACKER_MANIFEST_PATHS+=("$relpath")
         PACKER_MANIFEST_SIZES+=("$size")
-    done < <(rclone lsf -R --files-only --format "sp" --separator $'\t' "$PACKER_SOURCE_PATH" $DROPBOX_PACER_FLAGS 2>/dev/null)
-    log_info "Manifest complete: ${#PACKER_MANIFEST_PATHS[@]} file(s) discovered across all nesting levels."
+    done < "$scan_file"
+    rm -f "$scan_file"
+    log_info "Manifest complete: ${#PACKER_MANIFEST_PATHS[@]} file(s) to chunk (after resume filter)."
 }
 
 # Greedy bin-packing over the flat manifest — path depth plays no part in
@@ -874,7 +948,10 @@ Packer::build_local_tar() {
     local mount_dir="$1" chunk_tar="$2"
     shift 2
     local -a items=("$@")
-    tar cvf "$chunk_tar" -C "$mount_dir" "${items[@]}"
+    # Capture tar's stderr to a fixed sidecar so a failed build is diagnosable
+    # after the fact (tar's error otherwise goes only to the detached screen
+    # terminal and is lost). Single overwritten file, no per-chunk accumulation.
+    tar cvf "$chunk_tar" -C "$mount_dir" "${items[@]}" 2> "${chunk_tar%/*}/.last_tar.stderr"
 }
 
 Packer::verify_local_tar() {
@@ -1276,7 +1353,16 @@ run_tar_chunk_pipeline() {
     log_info "Mounting FUSE endpoint for chunk assembly: $src"
     local local_mnt
     local_mnt=$(mktemp -d)
-    rclone mount "$src" "$local_mnt" --daemon --allow-non-empty
+    # Read-side resilience: the FUSE mount serves tar's reads of the source.
+    # A bare mount lets a single transient Dropbox throttle/timeout during a
+    # 30+ min multi-file tar read propagate as EIO and abort the whole chunk
+    # (observed on chunk 52, v5.0.0). --vfs-cache-mode full decouples tar from
+    # live network reads: rclone downloads each object to the local cache with
+    # its own low-level retries/backoff (from $DROPBOX_PACER_FLAGS) and tar
+    # reads from disk, so a transient read is retried instead of failing the
+    # build.
+    rclone mount "$src" "$local_mnt" --daemon --allow-non-empty \
+        $DROPBOX_PACER_FLAGS --vfs-cache-mode full
     CURRENT_MOUNT_DIR="$local_mnt"
 
     local mount_wait=0
@@ -1308,7 +1394,7 @@ run_tar_chunk_pipeline() {
         log_info "[CHUNK ${chunk_idx}/${chunk_total}] Items: ${items[*]}"
 
         if ! Packer::build_local_tar "$local_mnt" "$chunk_tar" "${items[@]}"; then
-            Diagnostics::halt_chunk_pipeline "LOCAL_TAR_CREATE" "tar failed while building $chunk_tar" "$chunk_tar" "$local_mnt" "$src" "$dst_dir"
+            Diagnostics::halt_chunk_pipeline "LOCAL_TAR_CREATE" "tar failed while building $chunk_tar (stderr: ${chunk_tar%/*}/.last_tar.stderr)" "$chunk_tar" "$local_mnt" "$src" "$dst_dir"
         fi
         Diagnostics::mark_phase "$chunk_idx" "$chunk_total" "BUILT" "$chunk_tar"
 
