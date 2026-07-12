@@ -5,7 +5,7 @@
 # ==============================================================================
 # Description: On-the-fly streaming tar-archiver and raw copy tool with queue.
 # Framework: Modular pseudoclass-style Bash CLI (Core/Engine/System namespaces).
-# Version: 5.0.0
+# Version: 5.0.1
 # ==============================================================================
 
 set -eo pipefail
@@ -874,7 +874,10 @@ Packer::build_local_tar() {
     local mount_dir="$1" chunk_tar="$2"
     shift 2
     local -a items=("$@")
-    tar cvf "$chunk_tar" -C "$mount_dir" "${items[@]}"
+    # Capture tar's stderr to a fixed sidecar so a failed build is diagnosable
+    # after the fact (tar's error otherwise goes only to the detached screen
+    # terminal and is lost). Single overwritten file, no per-chunk accumulation.
+    tar cvf "$chunk_tar" -C "$mount_dir" "${items[@]}" 2> "${chunk_tar%/*}/.last_tar.stderr"
 }
 
 Packer::verify_local_tar() {
@@ -1276,7 +1279,15 @@ run_tar_chunk_pipeline() {
     log_info "Mounting FUSE endpoint for chunk assembly: $src"
     local local_mnt
     local_mnt=$(mktemp -d)
-    rclone mount "$src" "$local_mnt" --daemon --allow-non-empty
+    # Read-side resilience: the FUSE mount serves tar's reads of the source.
+    # A bare mount lets a single transient Dropbox throttle/timeout during a
+    # 30+ min multi-file tar read propagate as EIO and abort the whole chunk
+    # (observed on chunk 52, v5.0.0). --vfs-cache-mode full decouples tar from
+    # live network reads (rclone downloads each object to the local cache with
+    # its own backoff, tar reads from disk); the pacer flags + raised
+    # --vfs-read-retries ride out throttling instead of failing the build.
+    rclone mount "$src" "$local_mnt" --daemon --allow-non-empty \
+        $DROPBOX_PACER_FLAGS --vfs-cache-mode full --vfs-read-retries 20
     CURRENT_MOUNT_DIR="$local_mnt"
 
     local mount_wait=0
@@ -1308,7 +1319,7 @@ run_tar_chunk_pipeline() {
         log_info "[CHUNK ${chunk_idx}/${chunk_total}] Items: ${items[*]}"
 
         if ! Packer::build_local_tar "$local_mnt" "$chunk_tar" "${items[@]}"; then
-            Diagnostics::halt_chunk_pipeline "LOCAL_TAR_CREATE" "tar failed while building $chunk_tar" "$chunk_tar" "$local_mnt" "$src" "$dst_dir"
+            Diagnostics::halt_chunk_pipeline "LOCAL_TAR_CREATE" "tar failed while building $chunk_tar (stderr: ${chunk_tar%/*}/.last_tar.stderr)" "$chunk_tar" "$local_mnt" "$src" "$dst_dir"
         fi
         Diagnostics::mark_phase "$chunk_idx" "$chunk_total" "BUILT" "$chunk_tar"
 
