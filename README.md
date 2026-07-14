@@ -232,7 +232,13 @@ If purge duration becomes the dominant cost and looks like it's hitting Dropbox'
 
 Version history and a description of what changed in each release lives in [CHANGELOG.md](CHANGELOG.md).
 
-**Current version: 5.0.0** — decouples source purge from the transfer pipeline (`Core::AsyncPurger`): verified chunks' item lists are queued as durable manifests and deleted by a background purger concurrently with subsequent builds, instead of purge running as a blocking serial stage. Live measurement had shown purge (~70-110 min of server-throttled Dropbox deletes per chunk) dominating every cycle while build/push machinery idled. Crash-safe queue, same purge-only-after-verify guarantee, purge failures still halt the pipeline via a persisted flag.
+**Current version: 5.2.0** - chunk builds now tolerate transient FUSE-layer read/stat errors with a bounded rebuild-retry (cooldown between attempts, partial archives never carried forward, same build-clean-or-halt contract), and the previously-silent daemonized read mount logs to a file so a build failure's underlying API error is attributable. Builds on 5.0.1's mount cache hardening and 5.1.0's purge-lag-safe resume filter (see CHANGELOG).
+
+**v5.1.0** - makes crash-resume safe against the async purger lagging the build pipeline: the resume scan is filtered by set membership against the still-queued purge manifests, so chunks already pushed and verified but not yet purged are never re-archived under fresh part numbers. Proven against a live 287,606-file scan before release.
+
+**v5.0.1** - hardens the TAR-CHUNK read mount (`--vfs-cache-mode full` + pacer flags) after a transient Dropbox read error killed a 34-minute chunk build through the bare FUSE mount, and captures tar's stderr to a sidecar referenced in the halt banner.
+
+**v5.0.0** — decouples source purge from the transfer pipeline (`Core::AsyncPurger`): verified chunks' item lists are queued as durable manifests and deleted by a background purger concurrently with subsequent builds, instead of purge running as a blocking serial stage. Live measurement had shown purge (~70-110 min of server-throttled Dropbox deletes per chunk) dominating every cycle while build/push machinery idled. Crash-safe queue, same purge-only-after-verify guarantee, purge failures still halt the pipeline via a persisted flag.
 
 **v4.5.0** — generalizes v4.4.0's single dedicated purge remote into `DROPBOX_PURGE_REMOTES`, a list of one or more. When more than one is configured, a chunk's purge manifest is split round-robin across all of them and purged concurrently, one process per remote, each against its own independently-authorized rate-limit budget — instead of a single dedicated remote absorbing all of purge's request volume alone. A single-remote list (or the empty default) behaves exactly as v4.4.0 did.
 
