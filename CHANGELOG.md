@@ -2,6 +2,23 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [5.2.0] - 2026-07-14
+
+### Added
+- Bounded retry for transient chunk-build failures: `Packer::build_local_tar` now retries the whole tar build up to `TAR_BUILD_ATTEMPTS` times (default 3) with a `TAR_BUILD_RETRY_WAIT_SECONDS` cooldown (default 240s) between attempts, discarding the partial archive before every retry so a throttle window can pass. Motivated by the second live occurrence of the same failure shape (chunks 52 and 86 of the same migration, roughly 1 per 30+ builds): a single transient FUSE-layer EIO (a failed read in one case, a failed `stat` in the other) killing an otherwise-healthy ~30 min build minutes from completion, each costing a full pipeline halt plus a manual resume and rescan cycle. Both affected files were verified healthy via direct API listing immediately afterward, confirming the transient classification. The parity contract is unchanged: a chunk still either builds 100% clean or halts through the existing `LOCAL_TAR_CREATE` path after the final attempt, with the last partial tar preserved and the stderr sidecar referenced in the halt banner. Retry warnings quote the actual tar error line, so churn is visible in the durable log as it happens.
+- Mount-side error logging: the TAR-CHUNK `rclone mount` now runs with `--log-file /tmp/rclone_mount.log --log-level INFO`. The daemonized mount previously logged nowhere, so an EIO surfaced to tar left no record of the underlying API failure (which call, HTTP status, retry exhaustion) - the exact mechanism behind the chunk 52/86 aborts is still inference (leading hypothesis: rate-limit contention with the concurrent async purger, which shares the same per-authorization Dropbox budget whenever `DROPBOX_PURGE_REMOTES` is unset). The next occurrence will be attributable from the log instead.
+
+## [5.1.0] - 2026-07-12
+
+### Fixed
+- Crash-resume made safe against a lagging async purger. v5.0.0's TAR-CHUNK resume rescanned the live source and skipped `NEXT_CHUNK_IDX` chunks by count - only correct if exactly that many leading chunks' source files had already been purged. Async purge lags the build pipeline by design, so on a crash-resume the source still held files for chunks already `PUSHED` + verified whose purge was merely queued; those would be re-bin-packed and re-archived under fresh part numbers (duplication, corrupted numbering, and potential data loss where a partially-purged chunk rebuilt over its complete remote tar). `Packer::apply_resume_filter` now drops scan entries listed in any still-queued `state/pending_purge/*.manifest` before bin-packing, leaving only genuinely un-archived files to chunk; a consistency guard halts if a queued manifest is numbered above the persisted index (the index/enqueue crash window) rather than risk mislabeling a chunk over an existing remote archive. Proven against live data (287,606-file scan): the remainder began exactly at the expected first file of chunk 52, with zero already-archived files leaking through.
+
+## [5.0.1] - 2026-07-12
+
+### Fixed
+- TAR-CHUNK read mount hardened against transient Dropbox throttling. Chunk 52's tar build aborted ~34 min in when a single transient read error propagated through the bare FUSE mount as EIO and halted the pipeline (`LOCAL_TAR_CREATE`); the read mount had no resilience flags while the push path already ran retries + pacer. The mount now uses `--vfs-cache-mode full` plus `DROPBOX_PACER_FLAGS`: rclone downloads each object into its local cache with its own backoff and low-level retries, and tar reads from disk, decoupled from live network reads. (`--vfs-read-retries` was evaluated and dropped: not supported by rclone 1.60.x.)
+- tar's stderr is captured to a `.last_tar.stderr` sidecar referenced in the halt banner, so a failed build is diagnosable after the fact - the error previously went only to the detached screen terminal and was lost.
+
 ## [5.0.0] - 2026-07-11
 
 ### Changed
