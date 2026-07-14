@@ -5,7 +5,7 @@
 # ==============================================================================
 # Description: On-the-fly streaming tar-archiver and raw copy tool with queue.
 # Framework: Modular pseudoclass-style Bash CLI (Core/Engine/System namespaces).
-# Version: 5.1.0
+# Version: 5.2.0
 # ==============================================================================
 
 set -eo pipefail
@@ -34,6 +34,15 @@ DROPBOX_PACER_FLAGS="--tpslimit 4 --low-level-retries 10"
 # own name in the list too if you want it to also share the purge load
 # instead of being fully offloaded to dedicated remotes.
 DROPBOX_PURGE_REMOTES=""
+
+# Transient FUSE-layer EIOs (Dropbox throttling surfacing as a failed stat or
+# read through the mount) can kill an otherwise-healthy chunk build minutes
+# from the end. Retry the whole build a bounded number of times, with a
+# cooldown so the throttle window passes, before halting the pipeline. Every
+# retry rebuilds from scratch — a partial tar is never carried forward, so
+# the push/verify/purge parity guarantee is unchanged.
+TAR_BUILD_ATTEMPTS=3
+TAR_BUILD_RETRY_WAIT_SECONDS=240
 
 # ---------------------------------------------------------------------------
 # System::Diagnostics — logging primitives, durable execution log, and the
@@ -951,7 +960,24 @@ Packer::build_local_tar() {
     # Capture tar's stderr to a fixed sidecar so a failed build is diagnosable
     # after the fact (tar's error otherwise goes only to the detached screen
     # terminal and is lost). Single overwritten file, no per-chunk accumulation.
-    tar cvf "$chunk_tar" -C "$mount_dir" "${items[@]}" 2> "${chunk_tar%/*}/.last_tar.stderr"
+    local stderr_file="${chunk_tar%/*}/.last_tar.stderr"
+    local attempt
+    for (( attempt = 1; attempt <= TAR_BUILD_ATTEMPTS; attempt++ )); do
+        if tar cvf "$chunk_tar" -C "$mount_dir" "${items[@]}" 2> "$stderr_file"; then
+            return 0
+        fi
+        if [ "$attempt" -lt "$TAR_BUILD_ATTEMPTS" ]; then
+            # tar's final stderr line is always the generic "Exiting with
+            # failure status"; the line above it names the actual error.
+            log_warn "tar build attempt ${attempt}/${TAR_BUILD_ATTEMPTS} failed: $(tail -n 2 "$stderr_file" | head -n 1)"
+            log_warn "Discarding partial archive; retrying in ${TAR_BUILD_RETRY_WAIT_SECONDS}s..."
+            rm -f "$chunk_tar"
+            sleep "$TAR_BUILD_RETRY_WAIT_SECONDS"
+        fi
+    done
+    # Partial tar of the final attempt is left in place: the halt banner
+    # references it as "Preserved Local Tar" for inspection.
+    return 1
 }
 
 Packer::verify_local_tar() {
@@ -1361,8 +1387,13 @@ run_tar_chunk_pipeline() {
     # its own low-level retries/backoff (from $DROPBOX_PACER_FLAGS) and tar
     # reads from disk, so a transient read is retried instead of failing the
     # build.
+    # INFO-level mount log: the daemonized mount otherwise logs nowhere, so
+    # an EIO surfaced to tar leaves no record of the underlying API error
+    # (HTTP status, which call, retry exhaustion) — the one gap that kept the
+    # chunk 52/86 failures diagnosable only by inference.
     rclone mount "$src" "$local_mnt" --daemon --allow-non-empty \
-        $DROPBOX_PACER_FLAGS --vfs-cache-mode full
+        $DROPBOX_PACER_FLAGS --vfs-cache-mode full \
+        --log-file /tmp/rclone_mount.log --log-level INFO
     CURRENT_MOUNT_DIR="$local_mnt"
 
     local mount_wait=0
