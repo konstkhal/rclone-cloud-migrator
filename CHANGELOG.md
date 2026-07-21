@@ -2,6 +2,11 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [5.4.1] - 2026-07-21
+
+### Fixed
+- Interactive prompts inside command-substituted functions no longer hot-spin on stdin EOF. `prompt_strict_choice`, `select_remote`, and `select_dst_path` are all invoked as `VAR=$(fn ...)`; bash does not carry `errexit` into `$(...)` subshells (`inherit_errexit` unset), so a failed `read` (e.g. the script run with a closed or exhausted stdin pipe) left the answer variable empty, the validation branch rejected it, and the `while true` loop re-hit EOF instantly - an infinite CPU-bound spin instead of a termination. Every `read` in those functions now carries `|| exit 1`, which aborts the subshell, fails the assignment, and lets the top-level `set -eo pipefail` + ERR trap terminate cleanly. Interactive terminal sessions were never affected. Also realigned the script header version string, stale at 5.2.0 since the 5.3.0 release.
+
 ## [5.4.0] - 2026-07-21
 
 ### Added

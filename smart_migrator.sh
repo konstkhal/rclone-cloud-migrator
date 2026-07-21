@@ -5,7 +5,7 @@
 # ==============================================================================
 # Description: On-the-fly streaming tar-archiver and raw copy tool with queue.
 # Framework: Modular pseudoclass-style Bash CLI (Core/Engine/System namespaces).
-# Version: 5.2.0
+# Version: 5.4.1
 # ==============================================================================
 
 set -eo pipefail
@@ -151,10 +151,14 @@ parse_size_to_bytes() {
 # silently defaulting. Echoes the validated character to stdout so callers
 # can capture it via command substitution; the prompt itself goes to stderr
 # (bash's `read -p` behavior), so it never pollutes the captured value.
+# Every `read` in a $()-captured function carries `|| exit 1`: errexit is not
+# inherited inside command substitutions (inherit_errexit unset), so a failed
+# read (stdin EOF) would otherwise leave the variable empty and hot-spin the
+# enclosing while-true loop instead of terminating the script.
 prompt_strict_choice() {
     local prompt_msg="$1" valid_chars="$2" label="$3" answer
     while true; do
-        read -r -p "$prompt_msg" answer
+        read -r -p "$prompt_msg" answer || exit 1
         if [[ "$answer" =~ ^[${valid_chars}]$ ]]; then
             echo "$answer"
             return 0
@@ -235,7 +239,7 @@ select_remote() {
         done <<< "$REMOTE_LIST"
 
         echo "----------------------------------------------------------------------" >&2
-        read -r -p "$prompt_msg" r_idx
+        read -r -p "$prompt_msg" r_idx || exit 1
         if [[ "$r_idx" =~ ^[0-9]+$ ]] && [ "$r_idx" -lt "$i" ]; then
             selected="${REMOTE_ARRAY[$r_idx]}"
             selected="${selected// /}"
@@ -305,10 +309,10 @@ select_dst_path() {
         echo "  b) .. (Go back to parent directory)" >&2
         echo "  r) / (Reset navigation to remote root)" >&2
         echo "----------------------------------------------------------------------" >&2
-        read -r -p "$prompt_msg" choice
+        read -r -p "$prompt_msg" choice || exit 1
 
         if [ "$at_root" -eq 1 ] && [ "$choice" == "m" ]; then
-            read -r -p "Enter custom destination path (relative to remote root): " custom_path
+            read -r -p "Enter custom destination path (relative to remote root): " custom_path || exit 1
             echo "$custom_path"
             return 0
         elif [ "$at_root" -eq 1 ] && [ "$choice" == "0" ]; then
