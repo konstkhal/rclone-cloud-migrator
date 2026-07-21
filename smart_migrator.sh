@@ -5,7 +5,7 @@
 # ==============================================================================
 # Description: On-the-fly streaming tar-archiver and raw copy tool with queue.
 # Framework: Modular pseudoclass-style Bash CLI (Core/Engine/System namespaces).
-# Version: 5.4.2
+# Version: 5.5.0
 # ==============================================================================
 
 set -eo pipefail
@@ -167,6 +167,73 @@ prompt_strict_choice() {
     done
 }
 
+# ---------------------------------------------------------------------------
+# UI::Paginate — shared paging for the interactive listing menus so a long
+# folder/remote listing always fits one screen (the Tokyo screen session has
+# no recoverable scrollback once the buffer overflows). The paging is
+# DISPLAY-ONLY: printed indices are absolute (base + array position), so a
+# value shown on any page is the exact value the caller validates against the
+# full array — typing an index that lives on another page still works.
+# ---------------------------------------------------------------------------
+
+# Set by UI::paginate_render on every call so the caller can size navigation
+# and stay in sync with the page actually rendered (render clamps an
+# out-of-range page, e.g. after a terminal resize shrinks the list).
+PAGINATE_TOTAL_PAGES=1
+PAGINATE_PAGE=1
+
+# Rows to show per page, derived from the live terminal height minus the
+# static lines each menu prints around its list ($1 = that overhead). stty on
+# /dev/tty is queried first because these menus run inside command
+# substitution (stdout is a pipe there, which defeats `tput lines`); tput,
+# $LINES, and a fixed 20 are ordered fallbacks. Floored at 10 so a tiny window
+# still shows a usable slice.
+UI::page_size() {
+    local reserve="${1:-8}" rows=""
+    rows=$( { stty size </dev/tty ; } 2>/dev/null | awk '{print $1}' ) || rows=""
+    if ! [[ "$rows" =~ ^[0-9]+$ ]]; then rows=$( tput lines 2>/dev/null ) || rows=""; fi
+    [[ "$rows" =~ ^[0-9]+$ ]] || rows="${LINES:-}"
+    [[ "$rows" =~ ^[0-9]+$ ]] || { echo 20; return; }
+    local avail=$(( rows - reserve ))
+    [ "$avail" -lt 10 ] && avail=10
+    echo "$avail"
+}
+
+# Render one page of an entry array as "  <abs_index>) <entry>" lines, plus a
+# "-- Page X/Y (N entries total) --" footer only when the list spans more than
+# one page. Args: stream(1=stdout|2=stderr) base_index page page_size entries...
+# The stream is a parameter (not a fixed redirect) because the
+# command-substituted menus must keep all display on stderr to avoid polluting
+# the path they echo to stdout.
+UI::paginate_render() {
+    local stream="$1" base="$2" page="$3" page_size="$4"
+    shift 4
+    local -a entries=("$@")
+    local total=${#entries[@]}
+    local total_pages=$(( (total + page_size - 1) / page_size ))
+    [ "$total_pages" -lt 1 ] && total_pages=1
+    [ "$page" -gt "$total_pages" ] && page="$total_pages"
+    [ "$page" -lt 1 ] && page=1
+    PAGINATE_TOTAL_PAGES="$total_pages"
+    PAGINATE_PAGE="$page"
+
+    local start=$(( (page - 1) * page_size ))
+    local end=$(( start + page_size ))
+    [ "$end" -gt "$total" ] && end="$total"
+    {
+        local j
+        for (( j = start; j < end; j++ )); do
+            printf '  %s) %s\n' "$(( base + j ))" "${entries[$j]}"
+        done
+        [ "$total_pages" -gt 1 ] && \
+            printf -- '-- Page %s/%s (%s entries total) --\n' "$page" "$total_pages" "$total"
+    } >&"$stream"
+    # Always succeed: the single-page path leaves the falsy `-gt 1` test as the
+    # last status, which would trip errexit at the direct (non-substituted)
+    # configure_queue call sites.
+    return 0
+}
+
 # 1. Dry-run mode resolution — Direct Mode (-d/--dry-run flag) bypasses the
 # interactive safety prompt entirely; Default Mode always asks before
 # touching any remote.
@@ -226,28 +293,40 @@ fi
 
 select_remote() {
     local prompt_msg="$1"
-    local i selected r_idx remote
+    local i selected r_idx remote nav_hint
+    local -a REMOTE_ARRAY=()
+    i=0
+    while IFS= read -r remote; do
+        if [ -n "$remote" ]; then
+            REMOTE_ARRAY[$i]="$remote"
+            i=$((i + 1))
+        fi
+    done <<< "$REMOTE_LIST"
+    local count=$i
+    local page=1
     while true; do
         echo -e "\nAvailable storage nodes:" >&2
-        i=0
-        while IFS= read -r remote; do
-            if [ -n "$remote" ]; then
-                echo "  $i) $remote" >&2
-                REMOTE_ARRAY[$i]="$remote"
-                i=$((i + 1))
-            fi
-        done <<< "$REMOTE_LIST"
-
+        UI::paginate_render 2 0 "$page" "$(UI::page_size 5)" "${REMOTE_ARRAY[@]}"
+        page="$PAGINATE_PAGE"
         echo "----------------------------------------------------------------------" >&2
-        read -r -p "$prompt_msg" r_idx || exit 1
-        if [[ "$r_idx" =~ ^[0-9]+$ ]] && [ "$r_idx" -lt "$i" ]; then
+        nav_hint=""
+        [ "$PAGINATE_TOTAL_PAGES" -gt 1 ] && nav_hint="(n/p to page) "
+        read -r -p "${nav_hint}${prompt_msg}" r_idx || exit 1
+        if [ "$r_idx" == "n" ]; then
+            if [ "$page" -lt "$PAGINATE_TOTAL_PAGES" ]; then page=$((page + 1)); else log_warn "Already on the last page."; fi
+            continue
+        elif [ "$r_idx" == "p" ]; then
+            if [ "$page" -gt 1 ]; then page=$((page - 1)); else log_warn "Already on the first page."; fi
+            continue
+        fi
+        if [[ "$r_idx" =~ ^[0-9]+$ ]] && [ "$r_idx" -lt "$count" ]; then
             selected="${REMOTE_ARRAY[$r_idx]}"
             selected="${selected// /}"
             selected="${selected%:}:"
             echo "$selected"
             return 0
         else
-            log_err "Invalid selection index '$r_idx'. Range is 0 to $((i-1)). Try again."
+            log_err "Invalid selection index '$r_idx'. Range is 0 to $((count-1)). Try again."
         fi
     done
 }
@@ -292,26 +371,35 @@ select_dst_path() {
         fetch_dst_directories
     fi
     menu_dirs=("${DST_DIRS_CACHE[@]}")
+    local page=1
+    local nav_hint
 
     while true; do
         echo -e "\nAvailable destination directories on ${GLOBAL_DST_REMOTE}${current_path}:" >&2
         if [ "$at_root" -eq 1 ]; then
             echo "  0) / (remote root)" >&2
         fi
-        local i=1
-        for d in "${menu_dirs[@]}"; do
-            echo "  $i) $d" >&2
-            i=$((i + 1))
-        done
+        # base_index 1: this menu is 1-indexed (0 is reserved for the remote
+        # root shown above), so absolute index = array position + 1.
+        UI::paginate_render 2 1 "$page" "$(UI::page_size 9)" "${menu_dirs[@]}"
+        page="$PAGINATE_PAGE"
         if [ "$at_root" -eq 1 ]; then
             echo "  m) Manually type a custom path" >&2
         fi
         echo "  b) .. (Go back to parent directory)" >&2
         echo "  r) / (Reset navigation to remote root)" >&2
         echo "----------------------------------------------------------------------" >&2
-        read -r -p "$prompt_msg" choice || exit 1
+        nav_hint=""
+        [ "$PAGINATE_TOTAL_PAGES" -gt 1 ] && nav_hint="(n/p to page) "
+        read -r -p "${nav_hint}${prompt_msg}" choice || exit 1
 
-        if [ "$at_root" -eq 1 ] && [ "$choice" == "m" ]; then
+        if [ "$choice" == "n" ]; then
+            if [ "$page" -lt "$PAGINATE_TOTAL_PAGES" ]; then page=$((page + 1)); else log_warn "Already on the last page."; fi
+            continue
+        elif [ "$choice" == "p" ]; then
+            if [ "$page" -gt 1 ]; then page=$((page - 1)); else log_warn "Already on the first page."; fi
+            continue
+        elif [ "$at_root" -eq 1 ] && [ "$choice" == "m" ]; then
             read -r -p "Enter custom destination path (relative to remote root): " custom_path || exit 1
             echo "$custom_path"
             return 0
@@ -322,6 +410,7 @@ select_dst_path() {
             if [ -z "$current_path" ]; then
                 log_warn "Already at remote root. Cannot go back further."
             else
+                page=1
                 current_path="${current_path%/*}"
                 if [ -z "$current_path" ]; then
                     menu_dirs=("${DST_DIRS_CACHE[@]}")
@@ -340,6 +429,7 @@ select_dst_path() {
                 fi
             fi
         elif [ "$choice" == "r" ]; then
+            page=1
             current_path=""
             menu_dirs=("${DST_DIRS_CACHE[@]}")
             at_root=1
@@ -362,6 +452,7 @@ select_dst_path() {
                     [ -z "$sd" ] && continue
                     menu_dirs+=("$sd")
                 done <<< "$sub_listing"
+                page=1
                 at_root=0
                 prompt_msg="Select a subfolder index: "
             else
@@ -465,23 +556,34 @@ configure_queue() {
     if [ -z "$TOP_FOLDERS" ]; then
         log_warn "No automatic top-level directories detected."
     else
-        IFS=$'\n' read -r -d '' -a FOLDER_ARRAY <<< "$TOP_FOLDERS" || true
+        local -a RAW_FOLDERS=() FOLDER_ARRAY=()
+        IFS=$'\n' read -r -d '' -a RAW_FOLDERS <<< "$TOP_FOLDERS" || true
+        # Drop the trailing empty element the newline-terminated listing leaves
+        # behind so paging renders no blank rows; real entries keep their index.
+        local folder
+        for folder in "${RAW_FOLDERS[@]}"; do
+            [ -n "$folder" ] && FOLDER_ARRAY+=("$folder")
+        done
 
+        local page=1 nav_hint
         while true; do
             echo -e "\nDetected Top-Level Directories on Source:"
-            local i=0
-            for folder in "${FOLDER_ARRAY[@]}"; do
-                if [ -n "$folder" ]; then
-                    echo "  $i) $folder"
-                fi
-                i=$((i + 1))
-            done
+            UI::paginate_render 1 0 "$page" "$(UI::page_size 6)" "${FOLDER_ARRAY[@]}"
+            page="$PAGINATE_PAGE"
             echo "  q) Finished choosing folders (Proceed to next step)"
             echo "  e) [EXIT] Terminate system completely now"
             echo "----------------------------------------------------------------------"
-            read -r -p "Select a folder index to configure, 'q' to proceed, or 'e' to exit: " CHOSEN_IDX
+            nav_hint=""
+            [ "$PAGINATE_TOTAL_PAGES" -gt 1 ] && nav_hint="(n/p to page) "
+            read -r -p "${nav_hint}Select a folder index to configure, 'q' to proceed, or 'e' to exit: " CHOSEN_IDX || exit 1
 
-            if [ "$CHOSEN_IDX" == "e" ]; then
+            if [ "$CHOSEN_IDX" == "n" ]; then
+                if [ "$page" -lt "$PAGINATE_TOTAL_PAGES" ]; then page=$((page + 1)); else log_warn "Already on the last page."; fi
+                continue
+            elif [ "$CHOSEN_IDX" == "p" ]; then
+                if [ "$page" -gt 1 ]; then page=$((page - 1)); else log_warn "Already on the first page."; fi
+                continue
+            elif [ "$CHOSEN_IDX" == "e" ]; then
                 log_warn "Exit profile triggered by user. Aborting mission immediately."
                 exit 0
             elif [ "$CHOSEN_IDX" == "q" ]; then
@@ -516,30 +618,43 @@ configure_queue() {
                         SUB_SRC_ARRAY+=("$sf")
                     done <<< "$sub_listing"
 
-                    echo -e "\nSubfolders of $target_folder:"
-                    local si=0
-                    for sf in "${SUB_SRC_ARRAY[@]}"; do
-                        echo "  $si) $sf"
-                        si=$((si + 1))
-                    done
-                    echo "  b) .. (Go back to parent directory)"
-                    echo "  r) / (Reset navigation to remote root)"
-                    read -r -p "Select a subfolder index to drill into, 'b' to go back, or 'r' to reset: " sub_idx
-                    if [[ "$sub_idx" =~ ^[0-9]+$ ]] && [ "$sub_idx" -lt "${#SUB_SRC_ARRAY[@]}" ]; then
-                        target_folder="${target_folder}/${SUB_SRC_ARRAY[$sub_idx]}"
-                    elif [ "$sub_idx" == "b" ]; then
-                        if [ "$target_folder" == "$source_root_folder" ]; then
-                            log_info "Back at remote root. Returning to the top-level directory menu."
-                            continue 2
+                    # Inner pager for this listing. 'n'/'p' page in place;
+                    # every other outcome (drill/back/reset) leaves this loop so
+                    # the drilldown loop re-lists at the new level from page 1.
+                    local sub_page=1 sub_nav_hint
+                    while true; do
+                        echo -e "\nSubfolders of $target_folder:"
+                        UI::paginate_render 1 0 "$sub_page" "$(UI::page_size 5)" "${SUB_SRC_ARRAY[@]}"
+                        sub_page="$PAGINATE_PAGE"
+                        echo "  b) .. (Go back to parent directory)"
+                        echo "  r) / (Reset navigation to remote root)"
+                        sub_nav_hint=""
+                        [ "$PAGINATE_TOTAL_PAGES" -gt 1 ] && sub_nav_hint="(n/p to page) "
+                        read -r -p "${sub_nav_hint}Select a subfolder index to drill into, 'b' to go back, or 'r' to reset: " sub_idx || exit 1
+                        if [ "$sub_idx" == "n" ]; then
+                            if [ "$sub_page" -lt "$PAGINATE_TOTAL_PAGES" ]; then sub_page=$((sub_page + 1)); else log_warn "Already on the last page."; fi
+                            continue
+                        elif [ "$sub_idx" == "p" ]; then
+                            if [ "$sub_page" -gt 1 ]; then sub_page=$((sub_page - 1)); else log_warn "Already on the first page."; fi
+                            continue
+                        elif [[ "$sub_idx" =~ ^[0-9]+$ ]] && [ "$sub_idx" -lt "${#SUB_SRC_ARRAY[@]}" ]; then
+                            target_folder="${target_folder}/${SUB_SRC_ARRAY[$sub_idx]}"
+                            break
+                        elif [ "$sub_idx" == "b" ]; then
+                            if [ "$target_folder" == "$source_root_folder" ]; then
+                                log_info "Back at remote root. Returning to the top-level directory menu."
+                                continue 3
+                            else
+                                target_folder="${target_folder%/*}"
+                                break
+                            fi
+                        elif [ "$sub_idx" == "r" ]; then
+                            log_info "Navigation reset to remote root. Returning to the top-level directory menu."
+                            continue 3
                         else
-                            target_folder="${target_folder%/*}"
+                            log_err "Invalid subfolder index. Staying at current level: $target_folder"
                         fi
-                    elif [ "$sub_idx" == "r" ]; then
-                        log_info "Navigation reset to remote root. Returning to the top-level directory menu."
-                        continue 2
-                    else
-                        log_err "Invalid subfolder index. Staying at current level: $target_folder"
-                    fi
+                    done
                 else
                     break
                 fi
