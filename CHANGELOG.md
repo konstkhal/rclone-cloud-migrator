@@ -2,6 +2,11 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [5.3.0] - 2026-07-21
+
+### Added
+- Opt-in source directory-structure preservation for TAR-CHUNK, asked per folder in the interactive queue builder (right after the purge prompt, TAR-CHUNK mode only; default off). TAR-CHUNK chunks are built from a files-only manifest (`rclone lsf -R --files-only`), so a source directory that holds no file anywhere beneath it is carried by no chunk and is not recreated when the archive is extracted — the folder skeleton survives only where a directory contained at least one file. When enabled, `Packer::emit_structure_chunk` lists the full source directory tree and, from the still-live FUSE mount, builds one terminal structure archive `<folder>.part_dirs.tar` with `tar --no-recursion -T` (directory entries only — no file ever enters it, even while the async purger is mid-drain), then runs it through the same local-verify / resumable-push / remote-verify path as every data chunk. The whole tree is saved rather than only the computed-empty subset: directories that do hold files are recreated by the file chunks as well, so the duplicate entries are harmless no-ops on extraction, and saving everything keeps the archive self-contained with no manifest dependency and no crash-resume edge cases. The fixed, non-numeric name sits outside the `partNNN` sequence and sorts after it, so a `for f in *.part*.tar; do tar xf "$f"; done` restore applies it last; a destination existence check makes the step idempotent on crash-resume. The `keep_dirs` flag is threaded through the queue (push/pop) into `run_tar_chunk_pipeline`. Validated end-to-end against real `rclone`/`tar` (full-tree archived, files never leak via `--no-recursion`, idempotent resume, no-op extraction over an already-populated tree); the destination existence check was hardened with `|| true` so rclone's exit 3 on a not-yet-present archive does not trip `set -eo pipefail`. Default off; RAW/TAR modes and existing queues are unaffected.
+
 ## [5.2.0] - 2026-07-14
 
 ### Added
