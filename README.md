@@ -235,7 +235,7 @@ If purge duration becomes the dominant cost and looks like it's hitting Dropbox'
 
 Version history and a description of what changed in each release lives in [CHANGELOG.md](CHANGELOG.md).
 
-**Current version: 5.4.0** - directory-structure preservation extended to RAW mode via the same per-folder prompt: enabling it runs `rclone copy` with `--create-empty-src-dirs` so empty source folders are recreated on the destination. All three modes now preserve the source folder tree — TAR always (its `tar . ` archive inherently carries empty dirs), RAW and TAR-CHUNK on opt-in. TAR mode is not prompted since preservation there is unconditional.
+**Current version: 5.4.1** - wizard prompts hardened against stdin EOF: `read` calls inside command-substituted selector functions now abort the script instead of hot-spinning in their retry loops (bash does not inherit `errexit` into `$(...)` subshells). Interactive use was never affected; the spin only occurred when the script was driven by a pipe. Previous release (5.4.0): directory-structure preservation extended to RAW mode via the same per-folder prompt (`rclone copy --create-empty-src-dirs`), completing the set - TAR always preserves the tree, RAW and TAR-CHUNK on opt-in.
 
 **v5.3.0** - optional, per-folder directory-structure preservation for TAR-CHUNK: when enabled, a terminal `<folder>.part_dirs.tar` carrying the full source directory tree (bare directory entries, no files) is built, pushed, and verified alongside the data chunks, so extracting the archive recreates every folder — including any that were empty at the source and would otherwise be lost, since chunks pack a files-only manifest. Default off; RAW/TAR modes and existing queues unchanged.
 
