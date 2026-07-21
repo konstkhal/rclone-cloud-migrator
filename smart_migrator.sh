@@ -5,7 +5,7 @@
 # ==============================================================================
 # Description: On-the-fly streaming tar-archiver and raw copy tool with queue.
 # Framework: Modular pseudoclass-style Bash CLI (Core/Engine/System namespaces).
-# Version: 5.5.0
+# Version: 5.5.1
 # ==============================================================================
 
 set -eo pipefail
@@ -696,12 +696,10 @@ configure_queue() {
                     local sub_dst
                     sub_dst=$(select_dst_path "Select destination directory for '$target_folder' (index, 0=root, m=manual): ")
                     local final_src="${GLOBAL_SRC_REMOTE}${target_folder}"
-                    local final_dst
-                    if [ -n "$sub_dst" ]; then
-                        final_dst="${GLOBAL_DST_REMOTE}${sub_dst}/${target_folder}"
-                    else
-                        final_dst="${GLOBAL_DST_REMOTE}${target_folder}"
-                    fi
+                    # Flatten: rclone copy already merges src's children into dst,
+                    # so dst is exactly what was picked above — no wrapper folder
+                    # named after target_folder gets appended.
+                    local final_dst="${GLOBAL_DST_REMOTE}${sub_dst}"
                     ;;
                 2)
                     local mode="tar"
@@ -719,11 +717,16 @@ configure_queue() {
                     local sub_dst
                     sub_dst=$(select_dst_path "Select destination directory for '${target_folder}.tar' (index, 0=root, m=manual): ")
                     local final_src="${GLOBAL_SRC_REMOTE}${target_folder}"
+                    # Archive filename uses only the leaf folder name — a drilled-down
+                    # target_folder (e.g. TopFolder/Sub1/Sub2) must not resurrect its
+                    # intermediate path segments as real directories on the destination.
+                    local leaf_name
+                    leaf_name=$(basename "${target_folder%/}")
                     local final_dst
                     if [ -n "$sub_dst" ]; then
-                        final_dst="${GLOBAL_DST_REMOTE}${sub_dst}/${target_folder}.tar"
+                        final_dst="${GLOBAL_DST_REMOTE}${sub_dst}/${leaf_name}.tar"
                     else
-                        final_dst="${GLOBAL_DST_REMOTE}${target_folder}.tar"
+                        final_dst="${GLOBAL_DST_REMOTE}${leaf_name}.tar"
                     fi
                     ;;
                 3)
@@ -763,11 +766,15 @@ configure_queue() {
                     local sub_dst
                     sub_dst=$(select_dst_path "Select destination directory for '${target_folder}' chunk batches (index, 0=root, m=manual): ")
                     local final_src="${GLOBAL_SRC_REMOTE}${target_folder}"
+                    # Chunks folder uses only the leaf folder name — same rationale
+                    # as the TAR archive filename above.
+                    local leaf_name
+                    leaf_name=$(basename "${target_folder%/}")
                     local final_dst
                     if [ -n "$sub_dst" ]; then
-                        final_dst="${GLOBAL_DST_REMOTE}${sub_dst}/${target_folder}_chunks"
+                        final_dst="${GLOBAL_DST_REMOTE}${sub_dst}/${leaf_name}_chunks"
                     else
-                        final_dst="${GLOBAL_DST_REMOTE}${target_folder}_chunks"
+                        final_dst="${GLOBAL_DST_REMOTE}${leaf_name}_chunks"
                     fi
                     ;;
                 *)
@@ -1789,7 +1796,10 @@ while Queue::pop; do
         fi
 
         log_info "Launching deep hash check validation matrix..."
-        if rclone check "$src" "$dst" --checkers 4 --tpslimit 8; then
+        # --one-way: flattened dst can legitimately hold files that never came
+        # from this src (sibling folders, prior runs). Purge must gate on "did
+        # everything from src land intact", not "does dst contain nothing else".
+        if rclone check "$src" "$dst" --checkers 4 --tpslimit 8 --one-way; then
             log_info "Integrity matrix verified. Data matches."
             Diagnostics::mark_task_phase "raw" "VERIFIED" "$dst"
             if [ "$purge" == "yes" ]; then

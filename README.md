@@ -56,8 +56,9 @@ The script is a single self-contained Bash file with no external dependencies be
 
 ### RAW Copy Mode with Cryptographic Hash Verification
 - Transfers data with `rclone copy` (multi-transfer, buffered, non-destructive — never deletes anything at the destination).
-- Follows every transfer with `rclone check` to compare source and destination using backend-native checksums (MD5, SHA-1, or equivalent depending on the remote).
+- Follows every transfer with `rclone check --one-way` to confirm every source file landed correctly at the destination, using backend-native checksums (MD5, SHA-1, or equivalent depending on the remote). One-way because the destination is not exclusive to this task — it can legitimately hold files from sibling folders or prior runs — so purge gates on "did source arrive intact," not "does destination contain nothing else."
 - Purge is gated: the source is only deleted if the hash check exits cleanly.
+- Destination is used as picked, with nothing appended: `rclone copy` merges the source folder's contents directly into the chosen destination directory (no wrapper folder named after the source is created).
 - Optional directory-structure preservation (per-folder prompt, default off): `rclone copy` omits source directories that contain no file, so an empty source folder would be missing on the destination; when enabled, the copy runs with `--create-empty-src-dirs` and empty folders (including nested ones) are recreated on the destination.
 
 ### TAR-CHUNK Mode — Size-Bounded Local Archives with Incremental Purge
@@ -184,7 +185,7 @@ Choose engine action (1-3): 1                      # execute
 ```bash
 # After selecting remotes and folders interactively:
 # Mode: RAW, Purge: yes
-# → rclone copy src: dst: && rclone check src: dst: && rclone purge src:
+# → rclone copy src: dst: && rclone check src: dst: --one-way && rclone purge src:
 ```
 
 ### Example: chunked archive migration for a large nested folder
@@ -235,7 +236,9 @@ If purge duration becomes the dominant cost and looks like it's hitting Dropbox'
 
 Version history and a description of what changed in each release lives in [CHANGELOG.md](CHANGELOG.md).
 
-**Current version: 5.4.1** - wizard prompts hardened against stdin EOF: `read` calls inside command-substituted selector functions now abort the script instead of hot-spinning in their retry loops (bash does not inherit `errexit` into `$(...)` subshells). Interactive use was never affected; the spin only occurred when the script was driven by a pipe. Previous release (5.4.0): directory-structure preservation extended to RAW mode via the same per-folder prompt (`rclone copy --create-empty-src-dirs`), completing the set - TAR always preserves the tree, RAW and TAR-CHUNK on opt-in.
+**Current version: 5.5.1** - RAW mode no longer nests the source's own path under the destination: `rclone copy` now targets exactly the directory picked in the destination prompt, so a folder's contents land there directly instead of underneath a recreated copy of its full source path. TAR and TAR-CHUNK's archive filename / chunks-folder name switched from the full drilled-down path to just the leaf folder name, for the same reason. The RAW purge gate's `rclone check` now runs `--one-way`, since a flattened destination can legitimately hold files that never came from the current source (siblings, prior runs) - purge now correctly gates on "did everything from source land intact," not "does the destination contain nothing else."
+
+**v5.4.1** - wizard prompts hardened against stdin EOF: `read` calls inside command-substituted selector functions now abort the script instead of hot-spinning in their retry loops (bash does not inherit `errexit` into `$(...)` subshells). Interactive use was never affected; the spin only occurred when the script was driven by a pipe. Previous release (5.4.0): directory-structure preservation extended to RAW mode via the same per-folder prompt (`rclone copy --create-empty-src-dirs`), completing the set - TAR always preserves the tree, RAW and TAR-CHUNK on opt-in.
 
 **v5.3.0** - optional, per-folder directory-structure preservation for TAR-CHUNK: when enabled, a terminal `<folder>.part_dirs.tar` carrying the full source directory tree (bare directory entries, no files) is built, pushed, and verified alongside the data chunks, so extracting the archive recreates every folder — including any that were empty at the source and would otherwise be lost, since chunks pack a files-only manifest. Default off; RAW/TAR modes and existing queues unchanged.
 
