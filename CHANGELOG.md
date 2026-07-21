@@ -2,6 +2,11 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [5.4.2] - 2026-07-21
+
+### Fixed
+- Source folder drilldown: 'b' and 'r' now actually navigate. Both keys were fenced at the top-level folder chosen from the source menu ('source_root_folder'): 'b' at that level refused with "Already at top-level source root", and 'r' - despite its menu label "Reset navigation to remote root" - silently reset to the chosen folder, a no-op at the top level with no feedback at all. Once a folder was picked there was no way back to the top-level directory menu; a wrong pick forced the operator through the whole configuration flow or a script restart. Now 'b' at the chosen top-level folder and 'r' at any depth both return to the top-level source menu (the remote root's listing, which is what the 'r' label always promised), implemented as a 'continue 2' to the outer menu loop so 'target_folder' can never go empty and downstream naming still always sees a non-empty folder. Deeper-level 'b' behavior is unchanged (one level up). The drilldown prompt now names the current directory ("Drill down deeper into '<path>'?"), making every 'b' move visible instead of re-asking an anonymous y/n that made backing up look like a dead key.
+
 ## [5.4.1] - 2026-07-21
 
 ### Fixed
