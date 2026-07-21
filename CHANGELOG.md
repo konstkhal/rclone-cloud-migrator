@@ -2,6 +2,11 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [5.4.0] - 2026-07-21
+
+### Added
+- Directory-structure preservation extended to RAW mode, offered by the same per-folder prompt as TAR-CHUNK (default off). `rclone copy` omits source directories that contain no file, so an empty source folder would be absent on the destination; when the option is enabled for a RAW task, the copy runs with `--create-empty-src-dirs`, recreating empty folders (nested ones included) on the destination. Verified in isolation: empty and nested-empty directories land on the destination only when the flag is set. The prompt now fires for both RAW and TAR-CHUNK; TAR mode is intentionally not asked, because its streamed `tar cvf - . ` archive already carries the full directory tree (empty dirs included) unconditionally. Net effect: all three modes preserve the source folder structure — TAR always, RAW and TAR-CHUNK on opt-in. The generic prompt wording ("recreate empty folders on the destination") replaces the TAR-CHUNK-specific phrasing; the empty-string flag guard uses an `if` form so a "no" answer cannot trip `set -eo pipefail` at the top-level task loop.
+
 ## [5.3.0] - 2026-07-21
 
 ### Added
