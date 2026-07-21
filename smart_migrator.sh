@@ -660,16 +660,18 @@ configure_queue() {
             local final_purge="no"
             [[ "$purge_opt" == "y" || "$purge_opt" == "Y" ]] && final_purge="yes"
 
-            # Directory-structure preservation is a TAR-CHUNK-only concern:
-            # chunk tars are built from a files-only manifest, so a source
-            # directory holding no file anywhere beneath it is captured by no
-            # chunk and would not reappear on extraction. Opt-in per folder —
-            # the option adds one terminal structure archive of the full
-            # source folder tree and costs one extra recursive dir listing.
+            # Directory-structure preservation. Both RAW and TAR-CHUNK drop
+            # source directories that hold no file: rclone copy skips empty
+            # source dirs unless told otherwise, and chunk tars are built from
+            # a files-only manifest, so an empty dir is captured by no chunk.
+            # Opt-in per folder; the mechanism differs by mode (RAW adds
+            # --create-empty-src-dirs to the copy, TAR-CHUNK emits a structure
+            # archive). TAR mode is not asked — its `tar . ` archive already
+            # carries the whole tree, empty dirs included, unconditionally.
             local final_keep_dirs="no"
-            if [ "$mode" == "tar-chunk" ]; then
+            if [ "$mode" == "tar-chunk" ] || [ "$mode" == "raw" ]; then
                 local keep_dirs_opt
-                keep_dirs_opt=$(prompt_strict_choice "Preserve source directory structure (archive the folder tree so empty dirs are recreated on extraction)? (y/n): " "yYnN" "y or n")
+                keep_dirs_opt=$(prompt_strict_choice "Preserve source directory structure (recreate empty folders on the destination)? (y/n): " "yYnN" "y or n")
                 [[ "$keep_dirs_opt" == "y" || "$keep_dirs_opt" == "Y" ]] && final_keep_dirs="yes"
             fi
 
@@ -1648,7 +1650,12 @@ while Queue::pop; do
         log_info "Profile selected: RAW DIRECT COPY MODE (non-destructive; rclone copy only)."
         # Never rclone sync here: sync deletes destination files that don't exist
         # in the source, which is unacceptable when target paths can overlap.
-        if ! rclone copy "$src" "$dst" --progress --buffer-size 32M $PACER_FLAGS --transfers 4 --checkers 4 $DRY_RUN_FLAG; then
+        # --create-empty-src-dirs (opt-in): rclone copy otherwise omits source
+        # directories that contain no file, so empty folders would be lost on
+        # the destination. if-form, not `[ ] &&`, so a "no" can't trip set -e.
+        empty_dirs_flag=""
+        if [ "$keep_dirs" == "yes" ]; then empty_dirs_flag="--create-empty-src-dirs"; fi
+        if ! rclone copy "$src" "$dst" --progress --buffer-size 32M $PACER_FLAGS --transfers 4 --checkers 4 $empty_dirs_flag $DRY_RUN_FLAG; then
             log_err "FATAL: rclone copy failed for $src -> $dst"
             continue
         fi
