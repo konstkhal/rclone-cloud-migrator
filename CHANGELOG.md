@@ -2,6 +2,15 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [5.5.1] - 2026-07-21
+
+### Fixed
+- RAW mode no longer recreates the source's own path under the destination. `target_folder` holds the full drilled-down path from the source root (e.g. `REFERENCE/PRJS` after navigating into `REFERENCE` then `PRJS`), and the destination was built as `<picked dir>/<target_folder>` — so `rclone copy` landed the folder's contents at `<picked dir>/REFERENCE/PRJS/...` instead of directly inside the directory the operator picked. RAW mode now uses the picked destination directory as-is, with no folder appended: `rclone copy` already merges `target_folder`'s children into whatever `dst` it's given, so picking `PROJECTS` as the destination for `REFERENCE/PRJS` now correctly lands `PROJECTS/Effortless English/`, `PROJECTS/PJT LNG 2020/`, etc., matching what "put the source folder's content into the destination folder" actually means. Applies uniformly regardless of drill depth, including top-level (non-drilled) folders, which now also flatten into the picked destination rather than getting an automatic same-name subfolder; an explicit wrapper folder can still be obtained via the destination prompt's manual-path entry ('m').
+- TAR and TAR-CHUNK modes had the same underlying bug in their naming: the archive filename and the chunks-folder name were built from the full `target_folder` path rather than its leaf name, so a drilled-down folder produced real intermediate directories on the destination (e.g. `PROJECTS/REFERENCE/PRJS.tar`, with `REFERENCE` created as an actual folder just to hold one file) instead of `PROJECTS/PRJS.tar`. Both now use `basename(target_folder)`. Non-drilled top-level folders are unaffected (leaf name was already the full path).
+- The RAW-mode purge gate (`rclone check "$src" "$dst"`) now runs with `--one-way`. Flattening RAW's destination means `dst` is now routinely a shared directory that can legitimately contain files never sourced from this `src` (sibling folders migrated in the same run, pre-existing content, prior migrations). A two-way `rclone check` fails on any file present at `dst` but absent from `src`, which would have turned every flattened migration into a false integrity failure and silently skipped the purge the operator asked for. `--one-way` verifies only that everything from `src` landed correctly at `dst`, which is the condition that actually justifies deleting `src`; it cannot pass a run that the previous two-way check would have failed.
+
+Live-verified end-to-end (copy, one-way check, and purge, all three profile modes) against disposable local `alias`-type rclone remotes standing in for source/destination, so no real Dropbox/Drive data was touched: a nested source tree flattened correctly into a pre-populated destination directory, an unrelated pre-existing file at the destination did not block the integrity check or get purged from the destination-only side, file contents transferred intact, and the source directory was purged on verified success. TAR and TAR-CHUNK naming confirmed via queued task inspection.
+
 ## [5.4.2] - 2026-07-21
 
 ### Fixed
