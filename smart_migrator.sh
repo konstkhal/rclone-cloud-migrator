@@ -5,7 +5,7 @@
 # ==============================================================================
 # Description: On-the-fly streaming tar-archiver and raw copy tool with queue.
 # Framework: Modular pseudoclass-style Bash CLI (Core/Engine/System namespaces).
-# Version: 5.4.1
+# Version: 5.4.2
 # ==============================================================================
 
 set -eo pipefail
@@ -494,14 +494,15 @@ configure_queue() {
             fi
 
             local target_folder="${FOLDER_ARRAY[$CHOSEN_IDX]}"
-            # Boundary for 'b'/'r' navigation below — the top-level folder chosen above,
-            # not the remote's absolute root, since downstream naming requires a non-empty folder.
+            # 'b' at this folder and 'r' both escape to the top-level menu via
+            # 'continue 2' instead of clearing target_folder, so downstream
+            # naming always sees a non-empty folder.
             local source_root_folder="$target_folder"
 
             # Infinite on-demand recursive drilldown into subfolders
             while true; do
                 local drill_opt
-                drill_opt=$(prompt_strict_choice "Drill down deeper into this directory? (y/n): " "yYnN" "y or n")
+                drill_opt=$(prompt_strict_choice "Drill down deeper into '$target_folder'? (y/n): " "yYnN" "y or n")
                 if [[ "$drill_opt" == "y" || "$drill_opt" == "Y" ]]; then
                     local sub_listing
                     sub_listing=$(rclone lsf --dirs-only --dir-slash=false "${GLOBAL_SRC_REMOTE}${target_folder}" $DROPBOX_PACER_FLAGS 2>/dev/null) || true
@@ -528,12 +529,14 @@ configure_queue() {
                         target_folder="${target_folder}/${SUB_SRC_ARRAY[$sub_idx]}"
                     elif [ "$sub_idx" == "b" ]; then
                         if [ "$target_folder" == "$source_root_folder" ]; then
-                            log_warn "Already at top-level source root. Cannot go back further."
+                            log_info "Back at remote root. Returning to the top-level directory menu."
+                            continue 2
                         else
                             target_folder="${target_folder%/*}"
                         fi
                     elif [ "$sub_idx" == "r" ]; then
-                        target_folder="$source_root_folder"
+                        log_info "Navigation reset to remote root. Returning to the top-level directory menu."
+                        continue 2
                     else
                         log_err "Invalid subfolder index. Staying at current level: $target_folder"
                     fi
