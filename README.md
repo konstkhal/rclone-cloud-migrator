@@ -66,14 +66,15 @@ The script is a single self-contained Bash file with no external dependencies be
 - Fails safe: any error at any stage halts the entire pipeline immediately (`Diagnostics::halt_chunk_pipeline`), leaving the local buffer, remaining source data, and destination untouched for manual inspection — it never silently skips ahead.
 - Crash-safe resume: chunk numbering is persisted per source+destination task, so an interrupted run picks back up at the correct next index instead of resetting to `part001` and risking an overwrite of already-completed chunks. If no state file exists yet, it self-heals by probing the destination for the highest existing chunk already there.
 - Dry-run aware: chunks are still built and locally verified for a realistic preview, but remote push, verification, purge, and buffer flush are skipped.
+- Optional directory-structure preservation (per-folder prompt, default off): because chunks pack a files-only manifest, a source directory with no file anywhere beneath it is in no chunk and would not reappear on extraction. When enabled, one terminal `<folder>.part_dirs.tar` carrying the full source directory tree (bare `tar --no-recursion` entries, never any files) is built, pushed, and verified like any chunk, so extracting it alongside the data parts recreates every folder — including the empty ones. Idempotent on resume, and its fixed name sorts after the numeric parts so a `*.part*.tar` restore applies it last.
 - Useful for very large or deeply nested folders where a single unified TAR archive (see TAR mode above) would be impractical to build, push, or recover from if interrupted.
 
 ### Interactive Queue Builder
 - Numbered menus for remote selection and destination directory browsing.
 - Supports both auto-discovered top-level folders and manually typed nested paths.
-- Each queue entry carries its own mode (`raw` / `tar` / `tar-chunk`) and purge flag (`yes` / `no`), plus chunk size and local buffer path for `tar-chunk` entries.
+- Each queue entry carries its own mode (`raw` / `tar` / `tar-chunk`) and purge flag (`yes` / `no`), plus chunk size, local buffer path, and (for `tar-chunk`) a directory-structure preservation flag.
 - Queue is reviewable and resettable before execution begins.
-- Profile choice, engine action, purge confirmation, and folder drill-down prompts are all strictly white-list validated (`prompt_strict_choice`) — empty input, stray carriage returns, and out-of-set characters are rejected and re-prompted rather than silently defaulting.
+- Profile choice, engine action, purge confirmation, directory-structure preservation, and folder drill-down prompts are all strictly white-list validated (`prompt_strict_choice`) — empty input, stray carriage returns, and out-of-set characters are rejected and re-prompted rather than silently defaulting.
 
 ### Post-Transfer Safe Purge
 - Configurable per task at queue-build time.
@@ -153,6 +154,7 @@ In dry-run mode every `rclone` operation runs with `--dry-run`, so no data is co
    - `2` → TAR mode (streaming archive)
    - `3` → TAR-CHUNK mode (size-limited local archives with incremental purge) — enter a max chunk size and a local exchange buffer directory when prompted
    - Whether to purge the source after verified transfer
+   - (TAR-CHUNK only) whether to preserve the source directory structure — adds a `<folder>.part_dirs.tar` so empty folders are recreated on extraction
 5. **Add manual paths** — optionally add explicit nested source paths not shown in the top-level list.
 6. **Review and execute** — inspect the full task queue, then launch or reconfigure.
 
@@ -232,7 +234,9 @@ If purge duration becomes the dominant cost and looks like it's hitting Dropbox'
 
 Version history and a description of what changed in each release lives in [CHANGELOG.md](CHANGELOG.md).
 
-**Current version: 5.2.0** - chunk builds now tolerate transient FUSE-layer read/stat errors with a bounded rebuild-retry (cooldown between attempts, partial archives never carried forward, same build-clean-or-halt contract), and the previously-silent daemonized read mount logs to a file so a build failure's underlying API error is attributable. Builds on 5.0.1's mount cache hardening and 5.1.0's purge-lag-safe resume filter (see CHANGELOG).
+**Current version: 5.3.0** - optional, per-folder directory-structure preservation for TAR-CHUNK: when enabled, a terminal `<folder>.part_dirs.tar` carrying the full source directory tree (bare directory entries, no files) is built, pushed, and verified alongside the data chunks, so extracting the archive recreates every folder — including any that were empty at the source and would otherwise be lost, since chunks pack a files-only manifest. Default off; RAW/TAR modes and existing queues unchanged.
+
+**v5.2.0** - chunk builds now tolerate transient FUSE-layer read/stat errors with a bounded rebuild-retry (cooldown between attempts, partial archives never carried forward, same build-clean-or-halt contract), and the previously-silent daemonized read mount logs to a file so a build failure's underlying API error is attributable. Builds on 5.0.1's mount cache hardening and 5.1.0's purge-lag-safe resume filter (see CHANGELOG).
 
 **v5.1.0** - makes crash-resume safe against the async purger lagging the build pipeline: the resume scan is filtered by set membership against the still-queued purge manifests, so chunks already pushed and verified but not yet purged are never re-archived under fresh part numbers. Proven against a live 287,606-file scan before release.
 

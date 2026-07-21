@@ -385,17 +385,19 @@ declare -a QUEUE_MODE=()
 declare -a QUEUE_PURGE=()
 declare -a QUEUE_CHUNK_BYTES=()
 declare -a QUEUE_BUFFER_DIR=()
+declare -a QUEUE_KEEP_DIRS=()
 
 # Enqueue one task. Bash functions cannot return structs, so fields are
 # passed positionally.
 Queue::push() {
-    local src="$1" dst="$2" mode="$3" purge="$4" chunk_bytes="$5" buffer_dir="$6"
+    local src="$1" dst="$2" mode="$3" purge="$4" chunk_bytes="$5" buffer_dir="$6" keep_dirs="${7:-no}"
     QUEUE_SRC+=("$src")
     QUEUE_DST+=("$dst")
     QUEUE_MODE+=("$mode")
     QUEUE_PURGE+=("$purge")
     QUEUE_CHUNK_BYTES+=("$chunk_bytes")
     QUEUE_BUFFER_DIR+=("$buffer_dir")
+    QUEUE_KEEP_DIRS+=("$keep_dirs")
 }
 
 # Dequeue the oldest task (FIFO) into the QUEUE_POPPED_* globals below.
@@ -407,6 +409,7 @@ QUEUE_POPPED_MODE=""
 QUEUE_POPPED_PURGE=""
 QUEUE_POPPED_CHUNK_BYTES=""
 QUEUE_POPPED_BUFFER_DIR=""
+QUEUE_POPPED_KEEP_DIRS=""
 
 Queue::pop() {
     [ ${#QUEUE_SRC[@]} -eq 0 ] && return 1
@@ -416,12 +419,14 @@ Queue::pop() {
     QUEUE_POPPED_PURGE="${QUEUE_PURGE[0]}"
     QUEUE_POPPED_CHUNK_BYTES="${QUEUE_CHUNK_BYTES[0]}"
     QUEUE_POPPED_BUFFER_DIR="${QUEUE_BUFFER_DIR[0]}"
+    QUEUE_POPPED_KEEP_DIRS="${QUEUE_KEEP_DIRS[0]:-no}"
     QUEUE_SRC=("${QUEUE_SRC[@]:1}")
     QUEUE_DST=("${QUEUE_DST[@]:1}")
     QUEUE_MODE=("${QUEUE_MODE[@]:1}")
     QUEUE_PURGE=("${QUEUE_PURGE[@]:1}")
     QUEUE_CHUNK_BYTES=("${QUEUE_CHUNK_BYTES[@]:1}")
     QUEUE_BUFFER_DIR=("${QUEUE_BUFFER_DIR[@]:1}")
+    QUEUE_KEEP_DIRS=("${QUEUE_KEEP_DIRS[@]:1}")
     return 0
 }
 
@@ -655,7 +660,20 @@ configure_queue() {
             local final_purge="no"
             [[ "$purge_opt" == "y" || "$purge_opt" == "Y" ]] && final_purge="yes"
 
-            Queue::push "$final_src" "$final_dst" "$mode" "$final_purge" "${chunk_bytes:-}" "${buffer_dir:-}"
+            # Directory-structure preservation is a TAR-CHUNK-only concern:
+            # chunk tars are built from a files-only manifest, so a source
+            # directory holding no file anywhere beneath it is captured by no
+            # chunk and would not reappear on extraction. Opt-in per folder —
+            # the option adds one terminal structure archive of the full
+            # source folder tree and costs one extra recursive dir listing.
+            local final_keep_dirs="no"
+            if [ "$mode" == "tar-chunk" ]; then
+                local keep_dirs_opt
+                keep_dirs_opt=$(prompt_strict_choice "Preserve source directory structure (archive the folder tree so empty dirs are recreated on extraction)? (y/n): " "yYnN" "y or n")
+                [[ "$keep_dirs_opt" == "y" || "$keep_dirs_opt" == "Y" ]] && final_keep_dirs="yes"
+            fi
+
+            Queue::push "$final_src" "$final_dst" "$mode" "$final_purge" "${chunk_bytes:-}" "${buffer_dir:-}" "$final_keep_dirs"
             log_info "Successfully registered task to queue."
 
             # Remove configured folder and reindex to keep array dense
@@ -1346,6 +1364,74 @@ Purger::drain() {
     return "$rc"
 }
 
+# Builds and pushes a terminal "structure" archive holding the source's
+# entire directory tree, so every folder is recreated when the archive is
+# extracted — including any that hold no file and are therefore captured by
+# no files-only chunk. Directories that do hold files are recreated by the
+# file chunks as well; the duplicate entries here are harmless no-ops on
+# extraction. Opt-in per folder (keep_dirs=="yes").
+#
+# Fixed, non-numeric name (<folder>.part_dirs.tar) so it stands outside the
+# partNNN sequence and needs no chunk-index bookkeeping; it still sorts after
+# every numeric part, so a `for f in *.part*.tar; do tar xf "$f"; done` restore
+# applies it last. Idempotent via a destination existence check, so a
+# crash-resume skips a structure archive already pushed.
+Packer::emit_structure_chunk() {
+    local mount_dir="$1" src="$2" dst_dir="$3" folder_name="$4"
+    local struct_name="${folder_name}.part_dirs.tar"
+    local struct_tar="${PACKER_BUFFER_PATH%/}/${struct_name}"
+
+    # `|| true`: rclone exits 3 (dir/file not found) when the structure
+    # archive is absent — the normal first-run case — which pipefail would
+    # otherwise propagate into the assignment and trip set -e.
+    local existing
+    existing=$(rclone lsf --format s "${dst_dir%/}/${struct_name}" 2>/dev/null | head -1 || true)
+    if [[ "$existing" =~ ^[0-9]+$ ]] && [ "$existing" -gt 0 ]; then
+        log_info "Structure archive already present on destination (${struct_name}); skipping."
+        return 0
+    fi
+
+    # Enumerate every source directory — the full tree, empties included.
+    local dirs_file
+    dirs_file=$(mktemp) || { Diagnostics::halt_chunk_pipeline "STRUCTURE_TMP" "Failed to create structure scan tempfile" "" "$mount_dir" "$src" "$dst_dir"; }
+    rclone lsf -R --dirs-only --dir-slash=false "$src" $DROPBOX_PACER_FLAGS > "$dirs_file" 2>/dev/null || true
+
+    local n
+    n=$(grep -c . "$dirs_file" 2>/dev/null || true)
+    n=${n:-0}
+    if [ "$n" -eq 0 ]; then
+        log_info "Source has no subdirectories to preserve; structure archive not needed."
+        rm -f "$dirs_file"
+        return 0
+    fi
+
+    log_info "Preserving full directory tree (${n} director$([ "$n" -eq 1 ] && echo y || echo ies)) in structure archive ${struct_name}..."
+    # --no-recursion + explicit dir list: stores only the directory entries,
+    # never the files beneath them, so this stays a pure structure archive.
+    local stderr_file="${struct_tar%/*}/.last_tar.stderr"
+    if ! tar cvf "$struct_tar" -C "$mount_dir" --no-recursion -T "$dirs_file" 2> "$stderr_file"; then
+        rm -f "$dirs_file"
+        Diagnostics::halt_chunk_pipeline "STRUCTURE_TAR_CREATE" "tar failed building structure archive $struct_tar (stderr: $stderr_file)" "$struct_tar" "$mount_dir" "$src" "$dst_dir"
+    fi
+    rm -f "$dirs_file"
+
+    if ! Packer::verify_local_tar "$struct_tar"; then
+        Diagnostics::halt_chunk_pipeline "STRUCTURE_TAR_VERIFY" "Structure archive failed tar -tf integrity check: $struct_tar" "$struct_tar" "$mount_dir" "$src" "$dst_dir"
+    fi
+
+    log_info "Pushing structure archive ${struct_name}..."
+    if ! Transfer::resumable_push "$struct_tar" "$dst_dir"; then
+        Diagnostics::halt_chunk_pipeline "STRUCTURE_COPY" "rclone copy failed pushing $struct_tar to $dst_dir" "$struct_tar" "$mount_dir" "$src" "$dst_dir"
+    fi
+
+    local verify_err
+    if ! verify_err=$(Transfer::verify_remote_mass "$struct_tar" "$dst_dir"); then
+        Diagnostics::halt_chunk_pipeline "STRUCTURE_VERIFY" "$verify_err" "$struct_tar" "$mount_dir" "$src" "$dst_dir"
+    fi
+    log_info "Structure archive pushed and verified: ${struct_name}"
+    rm -f "$struct_tar"
+}
+
 # Incremental Local Buffer & Chunk-Based Purge Pipeline (TAR-CHUNK mode).
 # Deep-scans the full source manifest, bin-packs it into <= chunk_bytes
 # groups, archives each group to a local scratch file, validates it, pushes
@@ -1353,7 +1439,7 @@ Purger::drain() {
 # requested) purges only the source files that made it into that chunk
 # before moving to the next one.
 run_tar_chunk_pipeline() {
-    local src="$1" dst_dir="$2" chunk_bytes="$3" buffer_dir="$4" purge="$5"
+    local src="$1" dst_dir="$2" chunk_bytes="$3" buffer_dir="$4" purge="$5" keep_dirs="${6:-no}"
     local folder_name
     folder_name=$(basename "${src%/}")
 
@@ -1474,6 +1560,16 @@ run_tar_chunk_pipeline() {
         Diagnostics::mark_phase "$chunk_idx" "$chunk_total" "FLUSHED" "$chunk_tar"
     done
 
+    # Structure archive (empty source directories) — built from the still-live
+    # mount, before it is torn down. Opt-in per folder; independent of purge.
+    if [ "$keep_dirs" == "yes" ]; then
+        if [ -n "$DRY_RUN_FLAG" ]; then
+            log_info "[DRY-RUN] Empty-directory preservation requested; skipping structure archive build/push."
+        else
+            Packer::emit_structure_chunk "$local_mnt" "$src" "$dst_dir" "$folder_name"
+        fi
+    fi
+
     fusermount -u "$local_mnt" 2>/dev/null || true
     rmdir "$local_mnt" 2>/dev/null || true
     CURRENT_MOUNT_DIR=""
@@ -1496,6 +1592,7 @@ while Queue::pop; do
     purge="$QUEUE_POPPED_PURGE"
     chunk_bytes="$QUEUE_POPPED_CHUNK_BYTES"
     buffer_dir="$QUEUE_POPPED_BUFFER_DIR"
+    keep_dirs="$QUEUE_POPPED_KEEP_DIRS"
 
     echo -e "\n----------------------------------------------------------------------"
     log_info "CRITICAL ENGAGEMENT: Starting deployment of $src"
@@ -1577,7 +1674,7 @@ while Queue::pop; do
 
     elif [ "$mode" == "tar-chunk" ]; then
         log_info "Profile selected: TAR-CHUNK MODE. Building size-limited local archive batches..."
-        run_tar_chunk_pipeline "$src" "$dst" "$chunk_bytes" "$buffer_dir" "$purge"
+        run_tar_chunk_pipeline "$src" "$dst" "$chunk_bytes" "$buffer_dir" "$purge" "$keep_dirs"
     fi
 done
 
