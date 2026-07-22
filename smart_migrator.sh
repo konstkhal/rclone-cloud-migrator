@@ -5,7 +5,7 @@
 # ==============================================================================
 # Description: On-the-fly streaming tar-archiver and raw copy tool with queue.
 # Framework: Modular pseudoclass-style Bash CLI (Core/Engine/System namespaces).
-# Version: 5.5.1
+# Version: 5.5.2
 # ==============================================================================
 
 set -eo pipefail
@@ -1205,8 +1205,9 @@ RemoteLock::_try_one() {
         fi
     fi
 
-    if ! printf 'host=%s pid=%s started=%s\n' "$(hostname)" "$$" "$(date -Iseconds)" | rclone rcat "$lock_path" 2>/dev/null; then
-        log_warn "Could not write remote lock at ${lock_path} (no write access?) — skipping remote lock on ${remote_root}."
+    local rcat_err
+    if ! rcat_err=$(printf 'host=%s pid=%s started=%s\n' "$(hostname)" "$$" "$(date -Iseconds)" | rclone rcat "$lock_path" 2>&1); then
+        log_warn "Could not write remote lock at ${lock_path} - skipping remote lock on ${remote_root}. rclone: ${rcat_err//$'\n'/ }"
         return 0
     fi
 

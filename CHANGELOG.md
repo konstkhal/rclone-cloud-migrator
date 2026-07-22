@@ -2,6 +2,13 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [5.5.2] - 2026-07-22
+
+### Changed
+- The remote-lock write-failure warning now reports rclone's actual error instead of a fixed guess. `RemoteLock::_try_one` piped the lock-file `rclone rcat` through `2>/dev/null` and, on any failure, logged a hardcoded `"(no write access?)"` - which masked the real cause for every run since the feature shipped (v4.3.0). The write's stderr is now captured (`2>&1` into a command substitution, embedded newlines squashed so the persistent log stays one line per entry) and appended to the warning as `rclone: <error>`. No control-flow change: a failed write is still non-fatal (warn and continue, relying on the local flock plus the other remote's lock), and only a pre-existing foreign lock still halts a run.
+
+Context: on the Dropbox source remote this warning had fired on every engagement since v4.3.0, always with the same uninformative guess. The newly-surfaced error identified the cause conclusively - the source account is over its storage quota, so every upload (including the roughly 60-byte lock file) is rejected by Dropbox with `insufficient_space`, while deletes and reads keep working, which is why the migration's copy-and-purge path never showed it. The source-side lock therefore cannot be created until the account is back under quota; the destination-side (Google Drive) lock is written normally and already covers the same-task concurrency case this feature exists for. This release makes the failure legible; it does not itself restore source-side locking.
+
 ## [5.5.1] - 2026-07-21
 
 ### Fixed
