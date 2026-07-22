@@ -5,7 +5,7 @@
 # ==============================================================================
 # Description: On-the-fly streaming tar-archiver and raw copy tool with queue.
 # Framework: Modular pseudoclass-style Bash CLI (Core/Engine/System namespaces).
-# Version: 5.5.2
+# Version: 5.6.0
 # ==============================================================================
 
 set -eo pipefail
@@ -495,6 +495,22 @@ Queue::push() {
     QUEUE_KEEP_DIRS+=("$keep_dirs")
 }
 
+# Source folder paths (relative to the source root) already pushed to the
+# queue this session. Both configure_queue listing menus filter against this
+# set, so an already-queued path is never offered again - the mechanism that
+# prevents duplicate queue entries. Exact-match only by design: a parent of a
+# queued path stays selectable (its loose files may still need migrating) and
+# is guarded by an explicit overlap confirmation instead of being hidden.
+declare -a QUEUED_SRC_FOLDERS=()
+
+Queue::is_queued_folder() {
+    local candidate="$1" queued
+    for queued in "${QUEUED_SRC_FOLDERS[@]}"; do
+        [ "$queued" == "$candidate" ] && return 0
+    done
+    return 1
+}
+
 # Dequeue the oldest task (FIFO) into the QUEUE_POPPED_* globals below.
 # Returns 1 with the globals left untouched once the queue is empty, so
 # callers can drive a `while Queue::pop; do ...; done` loop.
@@ -534,6 +550,8 @@ Queue::reset() {
     QUEUE_PURGE=()
     QUEUE_CHUNK_BYTES=()
     QUEUE_BUFFER_DIR=()
+    QUEUE_KEEP_DIRS=()
+    QUEUED_SRC_FOLDERS=()
 }
 
 # Prints the full queue without consuming it (used by the review screen).
@@ -566,9 +584,18 @@ configure_queue() {
         done
 
         local page=1 nav_hint
+        local -a MENU_FOLDERS=()
         while true; do
+            # Rebuilt every pass: an entry disappears the moment its exact
+            # path is queued, while a top-level dir that only had subfolders
+            # queued stays listed so its siblings remain selectable.
+            MENU_FOLDERS=()
+            for folder in "${FOLDER_ARRAY[@]}"; do
+                Queue::is_queued_folder "$folder" || MENU_FOLDERS+=("$folder")
+            done
             echo -e "\nDetected Top-Level Directories on Source:"
-            UI::paginate_render 1 0 "$page" "$(UI::page_size 6)" "${FOLDER_ARRAY[@]}"
+            [ ${#MENU_FOLDERS[@]} -eq 0 ] && log_info "All detected top-level directories are already queued."
+            UI::paginate_render 1 0 "$page" "$(UI::page_size 6)" "${MENU_FOLDERS[@]}"
             page="$PAGINATE_PAGE"
             echo "  q) Finished choosing folders (Proceed to next step)"
             echo "  e) [EXIT] Terminate system completely now"
@@ -590,12 +617,12 @@ configure_queue() {
                 break
             fi
 
-            if ! [[ "$CHOSEN_IDX" =~ ^[0-9]+$ ]] || [ "$CHOSEN_IDX" -ge "${#FOLDER_ARRAY[@]}" ] || [ -z "${FOLDER_ARRAY[$CHOSEN_IDX]}" ]; then
+            if ! [[ "$CHOSEN_IDX" =~ ^[0-9]+$ ]] || [ "$CHOSEN_IDX" -ge "${#MENU_FOLDERS[@]}" ]; then
                 log_err "Invalid selection index. Please try again."
                 continue
             fi
 
-            local target_folder="${FOLDER_ARRAY[$CHOSEN_IDX]}"
+            local target_folder="${MENU_FOLDERS[$CHOSEN_IDX]}"
             # 'b' at this folder and 'r' both escape to the top-level menu via
             # 'continue 2' instead of clearing target_folder, so downstream
             # naming always sees a non-empty folder.
@@ -615,8 +642,13 @@ configure_queue() {
                     local -a SUB_SRC_ARRAY=()
                     while IFS= read -r sf; do
                         [ -z "$sf" ] && continue
+                        Queue::is_queued_folder "${target_folder}/${sf}" && continue
                         SUB_SRC_ARRAY+=("$sf")
                     done <<< "$sub_listing"
+                    if [ ${#SUB_SRC_ARRAY[@]} -eq 0 ]; then
+                        log_warn "All subfolders under '$target_folder' are already queued. Answer 'n' to use this path as-is."
+                        continue
+                    fi
 
                     # Inner pager for this listing. 'n'/'p' page in place;
                     # every other outcome (drill/back/reset) leaves this loop so
@@ -659,6 +691,34 @@ configure_queue() {
                     break
                 fi
             done
+
+            # Filtered menus make an exact re-queue impossible, but a parent
+            # of already-queued tasks is still selectable. FIFO runs the
+            # nested tasks first, so this is legitimate when they purge their
+            # source (queue a heavy subtree as TAR-CHUNK+purge, then sweep
+            # the rest of the parent) - and double-copies their data when
+            # they don't. Surface the overlap and let the operator decide.
+            local queued_nested overlap_found=0
+            for queued_nested in "${QUEUED_SRC_FOLDERS[@]}"; do
+                case "$queued_nested" in
+                    "$target_folder"/*)
+                        if [ "$overlap_found" -eq 0 ]; then
+                            overlap_found=1
+                            log_warn "Already-queued task(s) are nested inside '$target_folder':"
+                        fi
+                        echo "  - $queued_nested" >&2
+                        ;;
+                esac
+            done
+            if [ "$overlap_found" -eq 1 ]; then
+                log_warn "Their data will be copied again by this task unless they purge their source first."
+                local overlap_opt
+                overlap_opt=$(prompt_strict_choice "Queue '$target_folder' anyway? (y/n): " "yYnN" "y or n")
+                if [[ "$overlap_opt" == "n" || "$overlap_opt" == "N" ]]; then
+                    log_info "Skipping '$target_folder'. Returning to the top-level directory menu."
+                    continue
+                fi
+            fi
 
             echo -e "\n======================================================================"
             echo -e "Configuring Folder: \033[1;34m$target_folder\033[0m"
@@ -805,11 +865,8 @@ configure_queue() {
             fi
 
             Queue::push "$final_src" "$final_dst" "$mode" "$final_purge" "${chunk_bytes:-}" "${buffer_dir:-}" "$final_keep_dirs"
+            QUEUED_SRC_FOLDERS+=("$target_folder")
             log_info "Successfully registered task to queue."
-
-            # Remove configured folder and reindex to keep array dense
-            unset "FOLDER_ARRAY[$CHOSEN_IDX]"
-            FOLDER_ARRAY=("${FOLDER_ARRAY[@]}")
         done
     fi
 }
