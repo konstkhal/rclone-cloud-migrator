@@ -5,7 +5,7 @@
 # ==============================================================================
 # Description: On-the-fly streaming tar-archiver and raw copy tool with queue.
 # Framework: Modular pseudoclass-style Bash CLI (Core/Engine/System namespaces).
-# Version: 5.6.0
+# Version: 5.7.0
 # ==============================================================================
 
 set -eo pipefail
@@ -55,6 +55,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/logs"
 mkdir -p "$LOG_DIR" 2>/dev/null || true
 LOG_FILE="${LOG_DIR}/smart_migrator_$(date '+%Y%m%d_%H%M%S')_$$.log"
+
+# Every TAR-CHUNK-mode rclone invocation (scan, push, purge delete, FUSE
+# mount) logs its own real diagnostic output here, not just this script's
+# own success/failure summary — a silent stall or rate-limit error used to
+# be diagnosable only by inference (see the chunk 52/86 mount-log fix this
+# mirrors for the rest of the pipeline).
+RCLONE_LOG_FILE="${LOG_DIR}/smart_migrator_rclone_$(date '+%Y%m%d_%H%M%S')_$$.log"
+RCLONE_LOG_FLAGS=(-v --log-file "$RCLONE_LOG_FILE")
+RCLONE_OBS_FLAGS=(-v --log-file "$RCLONE_LOG_FILE" --stats 1m --stats-one-line)
 
 _log_persist() { printf '%s\n' "$1" >> "$LOG_FILE" 2>/dev/null || true; }
 
@@ -983,6 +992,7 @@ PACKER_MAX_CHUNK_SIZE=0
 PACKER_PURGE_ON_SUCCESS="no"
 PACKER_NEXT_CHUNK_IDX=0
 PACKER_STATE_FILE=""
+PACKER_MANIFEST_FILE=""
 PACKER_DST_DIR=""
 
 declare -a PACKER_MANIFEST_PATHS=()
@@ -1010,6 +1020,7 @@ Packer::init() {
     local task_key
     task_key=$(Core::task_key "$PACKER_SOURCE_PATH" "$dst_dir")
     PACKER_STATE_FILE="${state_dir}/.chunk_idx__${task_key}.state"
+    PACKER_MANIFEST_FILE="${state_dir}/.manifest__${task_key}.tsv"
 
     if [ -f "$PACKER_STATE_FILE" ]; then
         PACKER_NEXT_CHUNK_IDX=$(cat "$PACKER_STATE_FILE" 2>/dev/null)
@@ -1104,18 +1115,46 @@ Packer::apply_resume_filter() {
 # Builds a flat manifest of every file under source_path, however deeply
 # nested, via rclone's own recursive listing rather than a top-level-only
 # directory walk — this is what fixes the v3.0 bug where a single nested
-# directory holding hundreds of GiB was invisible to the bin-packer. The
-# scan is materialized to a temp file so the resume-safety filter can run a
-# single set-membership pass over it before it becomes the in-memory manifest.
+# directory holding hundreds of GiB was invisible to the bin-packer.
+#
+# The listing is fetched from the remote ONCE per task and frozen, sorted
+# (LC_ALL=C), to PACKER_MANIFEST_FILE; every later invocation reuses that
+# frozen copy instead of re-listing. The remote does not guarantee stable
+# ordering across separate recursive listings of a folder this large, and a
+# re-scan-every-run design was observed to shift chunk boundaries between
+# attempts (the same nominal chunk position produced a different file count
+# on two different days against docu_trans_process). Freezing removes that
+# source of drift; delete PACKER_MANIFEST_FILE by hand to force a rescan.
+# Packer::apply_resume_filter still runs against it unchanged on every call
+# (first run and resumes alike) — freezing the base listing doesn't touch
+# its pending-purge cross-check, kept as-is as a defense-in-depth safety net.
+#
+# The scan is materialized to a temp file so the resume-safety filter can run
+# a single set-membership pass over it before it becomes the in-memory manifest.
+PACKER_MANIFEST_REUSED="no"
+
 Packer::scan_payload() {
-    log_info "Deep-scanning full recursive file manifest under ${PACKER_SOURCE_PATH}..."
     local scan_file
     scan_file=$(mktemp)
-    # `|| true`: a non-zero rclone exit (e.g. a transient listing error near
-    # the end of a long recursive scan) must not abort the run under set -e —
-    # the previous process-substitution form masked rclone's exit code, and
-    # this direct redirect would otherwise expose it.
-    rclone lsf -R --files-only --format "sp" --separator $'\t' "$PACKER_SOURCE_PATH" $DROPBOX_PACER_FLAGS > "$scan_file" 2>/dev/null || true
+    PACKER_MANIFEST_REUSED="no"
+
+    if [ -s "$PACKER_MANIFEST_FILE" ]; then
+        PACKER_MANIFEST_REUSED="yes"
+        log_info "Reusing frozen manifest ($(wc -l < "$PACKER_MANIFEST_FILE") file(s)) from $(stat -c%y "$PACKER_MANIFEST_FILE" | cut -d. -f1); the remote is not re-scanned. Delete $PACKER_MANIFEST_FILE to force a rescan."
+        cp "$PACKER_MANIFEST_FILE" "$scan_file"
+    else
+        log_info "Deep-scanning full recursive file manifest under ${PACKER_SOURCE_PATH}..."
+        # `|| true`: a non-zero rclone exit (e.g. a transient listing error near
+        # the end of a long recursive scan) must not abort the run under set -e —
+        # the previous process-substitution form masked rclone's exit code, and
+        # this direct redirect would otherwise expose it.
+        rclone lsf -R --files-only --format "sp" --separator $'\t' "$PACKER_SOURCE_PATH" $DROPBOX_PACER_FLAGS "${RCLONE_LOG_FLAGS[@]}" > "$scan_file" 2>/dev/null || true
+        if [ -s "$scan_file" ]; then
+            LC_ALL=C sort -t $'\t' -k2 -o "$scan_file" "$scan_file"
+            cp "$scan_file" "$PACKER_MANIFEST_FILE"
+            log_info "Froze manifest: $(wc -l < "$PACKER_MANIFEST_FILE") file(s) -> $PACKER_MANIFEST_FILE (remote will not be re-scanned again for this task)."
+        fi
+    fi
 
     Packer::apply_resume_filter "$scan_file"
 
@@ -1314,7 +1353,7 @@ TRANSFER_PUSHED_BYTES=0
 Transfer::resumable_push() {
     local local_tar="$1" dst_dir="$2"
     local rc=0
-    rclone copy "$local_tar" "${dst_dir%/}/" $PACER_FLAGS --progress || rc=$?
+    rclone copy "$local_tar" "${dst_dir%/}/" $PACER_FLAGS --progress "${RCLONE_OBS_FLAGS[@]}" || rc=$?
     if [ "$rc" -ne 0 ]; then
         return "$rc"
     fi
@@ -1400,7 +1439,7 @@ Transfer::purge_source_manifest() {
 
     for ((i = 0; i < n; i++)); do
         local delete_target="${purge_remotes[i]}${path_only}"
-        ( rclone delete "$delete_target" --files-from "${manifests[i]}" --no-traverse $DROPBOX_PACER_FLAGS > "${outfiles[i]}" 2>&1 ) &
+        ( rclone delete "$delete_target" --files-from "${manifests[i]}" --no-traverse $DROPBOX_PACER_FLAGS "${RCLONE_OBS_FLAGS[@]}" > "${outfiles[i]}" 2>&1 ) &
         pids[i]=$!
     done
 
@@ -1636,6 +1675,7 @@ run_tar_chunk_pipeline() {
         Diagnostics::halt_chunk_pipeline "BUFFER_INIT" "Cannot create local buffer directory: $buffer_dir" "" "" "$src" "$dst_dir"
     fi
 
+    log_info "Verbose rclone log for this task's scan/mount/push/purge: $RCLONE_LOG_FILE"
     Packer::init "$src" "$buffer_dir" "$chunk_bytes" "$purge" "$dst_dir"
     Packer::scan_payload
 
@@ -1645,6 +1685,38 @@ run_tar_chunk_pipeline() {
     fi
 
     Packer::generate_chunks
+
+    # Packer::apply_resume_filter (inside Packer::scan_payload) only ever
+    # subtracts files whose purge is still QUEUED (state/pending_purge) — the
+    # crash-recovery window between a chunk's remote verify and its purge
+    # completing. It was never the mechanism that hid FULLY completed and
+    # already-purged chunks: previously that fell out for free, because a
+    # fresh `rclone lsf` naturally no longer listed files that were actually
+    # deleted. A frozen manifest never re-lists, so those files never leave
+    # it — hence this explicit position-based skip is now required, safe
+    # ONLY because the frozen manifest makes Packer::generate_chunks
+    # deterministic across runs (same manifest + same chunk_bytes always
+    # bins identically), so the first PACKER_NEXT_CHUNK_IDX chunks it
+    # produces are guaranteed to be the exact chunks already pushed+purged.
+    #
+    # Only applies when REUSING a manifest frozen by an earlier run of this
+    # same task. When the manifest was just frozen THIS run (PACKER_MANIFEST_REUSED
+    # == no), it came from a live scan that already reflects current remote
+    # reality — e.g. a first run under this task_key against a folder another
+    # tool (or a lost state file) already partially archived: PACKER_NEXT_CHUNK_IDX
+    # is then a pure destination-reconciled naming offset, not a count of
+    # entries still sitting in THIS manifest, and already-purged files were
+    # never scanned into it to begin with. Skipping here would silently treat
+    # real remaining work as already done.
+    if [ "$PACKER_MANIFEST_REUSED" == "yes" ] && [ "$PACKER_NEXT_CHUNK_IDX" -gt 0 ]; then
+        PACKER_CHUNKS=("${PACKER_CHUNKS[@]:$PACKER_NEXT_CHUNK_IDX}")
+        log_info "Resuming: skipping $PACKER_NEXT_CHUNK_IDX already-completed chunk(s); ${#PACKER_CHUNKS[@]} remaining."
+    fi
+
+    if [ ${#PACKER_CHUNKS[@]} -eq 0 ]; then
+        log_info "All chunks for $src were already completed in a prior run. Nothing left to do."
+        return 0
+    fi
 
     if [ "$PACKER_PURGE_ON_SUCCESS" == "yes" ] && [ -z "$DRY_RUN_FLAG" ]; then
         Purger::init
@@ -1665,10 +1737,13 @@ run_tar_chunk_pipeline() {
     # INFO-level mount log: the daemonized mount otherwise logs nowhere, so
     # an EIO surfaced to tar leaves no record of the underlying API error
     # (HTTP status, which call, retry exhaustion) — the one gap that kept the
-    # chunk 52/86 failures diagnosable only by inference.
+    # chunk 52/86 failures diagnosable only by inference. Shares
+    # RCLONE_LOG_FILE with the rest of this task's rclone calls (was a fixed
+    # /tmp path before, so a second run could clobber the first run's record
+    # and nothing survived a reboot).
     rclone mount "$src" "$local_mnt" --daemon --allow-non-empty \
         $DROPBOX_PACER_FLAGS --vfs-cache-mode full \
-        --log-file /tmp/rclone_mount.log --log-level INFO
+        --log-file "$RCLONE_LOG_FILE" --log-level INFO
     CURRENT_MOUNT_DIR="$local_mnt"
 
     local mount_wait=0
