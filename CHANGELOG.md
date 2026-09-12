@@ -2,6 +2,15 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [5.7.0] - 2026-09-12
+
+### Fixed
+- TAR-CHUNK mode's `Packer::scan_payload` now lists the remote once per task and freezes an `LC_ALL=C`-sorted manifest to a local state file instead of re-scanning on every resume. A live recursive listing of a very large folder does not guarantee stable ordering across separate calls - directly observed against `docu_trans_process` (259G, 52 chunks), where the same nominal chunk position produced a different file count on two different days, which is what made that job's repeated failures undiagnosable. Delete the frozen manifest file to force a rescan.
+- Every TAR-CHUNK rclone invocation (manifest scan, FUSE mount, chunk push, async purge delete) now logs its own full diagnostic output to one durable, timestamped rclone log (`-v --log-file`, plus `--stats` on real transfers) instead of losing it on failure. The FUSE mount's log was previously a fixed, unrotated `/tmp/rclone_mount.log` that a second concurrent task could clobber.
+- Freezing the manifest broke an implicit assumption `Packer::apply_resume_filter` relied on: a live re-scan naturally stopped listing files that were actually deleted, so a fully-completed chunk needed no explicit exclusion. A frozen manifest never re-lists, so a second run of the same task tried to rebuild an already-purged chunk out of files that no longer existed - caught live during verification, before it ever touched real data. Fixed by skipping the first `PACKER_NEXT_CHUNK_IDX` chunks by array position when reusing an already-frozen manifest from a prior run of the same task, safe only because freezing makes the bin-packing deterministic across runs. That skip is gated on the manifest having been reused rather than freshly scanned this run, so a first run against a folder another tool (or a lost state file) already partially archived - destination-reconciled chunk numbering - still processes all remaining work instead of silently skipping it. `Packer::apply_resume_filter` itself is unchanged, kept as defense-in-depth for the pending-purge crash-recovery window it was built for.
+
+Validated with `bash -n` plus real functional runs against small disposable gdrive folders (no bats/shellcheck installed, so this is not a mocked unit-test suite): every function extracted into an isolated harness bypassing the interactive menu, run through a fresh cycle and a resume cycle (content byte-diffed correct, including a Cyrillic filename), which is what caught the resume-reuse bug above; then a destination-reconciliation scenario matching `docu_trans_process`'s real situation (existing part-files, no state file, source still holding the remaining files) confirmed the fix processes all real remaining work rather than reporting false completion. All disposable test data purged afterward. Deployed live against `docu_trans_process` the same day.
+
 ## [5.6.0] - 2026-07-22
 
 ### Fixed
