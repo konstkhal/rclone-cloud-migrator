@@ -2,6 +2,22 @@
 
 All notable changes to `rclone-cloud-migrator` are documented in this file.
 
+## [5.8.0] - 2026-09-18
+
+### Fixed
+- TAR-CHUNK resume no longer treats the persisted chunk index as a position inside the frozen manifest. That index is the next tar *name* index on the destination; the two quantities are equal only when a manifest is frozen with no naming offset already in force, and they diverged the first time that assumption met real state. Against `docu_trans_process` the manifest was frozen on 2026-09-12 while an offset of 34 was in force, two batches ran, the index persisted as 36, and every later run dropped 36 batches of a manifest that had only ever completed two. Manifest lines 3254 through 90228 - 86,975 files, 169.96 GiB - were jumped in one step and never revisited, while the run logged `All 10 chunk(s) processed successfully` and exited 0. No data was lost: the gap is unarchived, not deleted. Freezing a manifest now records the naming offset in force at that moment to `state/.manifest_base__<task>.state`, and a resume skips `next_chunk_index - base` batches. A reused manifest with no recorded base halts instead of assuming zero, as do a negative skip and a skip past the end of the plan.
+- This supersedes the third "Fixed" bullet of 5.7.0 below, which described that position-based skip as safe because freezing makes the bin-packing deterministic. Determinism was never the weak link - the skip and the index were measuring different things.
+
+### Added
+- Completion contract. The TAR-CHUNK pipeline may no longer return success without proving it: under `purge=yes` it re-lists the source once the purge queue has drained and fails loudly if anything remains; under `purge=no` it asserts every planned batch was processed. Both exits are routed through it, including the "already completed in a prior run" early return - the exact path the 2026-09-18 run exited through. A dry run asserts nothing.
+- `tests/resume_arithmetic.bats`, this repository's first test suite (bats-core 1.14.0). 15 tests over the resume arithmetic and the completion contract, with `rclone` replaced by a recording test double and `Diagnostics::halt_chunk_pipeline` stubbed so a test can assert which guard fired. The harness reuses the same brace-matching function extraction `run_tar_chunk_task.sh` performs, so the suite always exercises the current function bodies rather than a copy that can drift. The regression pin models the 2026-09-12 sequence directly.
+- `docs/tar-chunk-resume.md` - the resume, naming and completion specification, with the evidence for the defect and the recovery procedure.
+
+### Changed
+- `Purger::start` refuses to start a second daemon when one is already recorded. `Purger::daemon_loop` dequeues by find-then-rm rather than atomically, so two daemons would select the same manifest and race it; the single-daemon invariant was previously positional (the call sites happened to be mutually exclusive) and is now structural.
+
+Verified with `bats tests/resume_arithmetic.bats` (15/15) and `shellcheck`, which matches the pre-change baseline exactly (10x SC2086, 1x SC2004, both pre-existing). The two SC2317 findings introduced are suppressed at the line with their reason. Additionally exercised against the real `docu_trans_process` state, where the new guard halted at `RESUME_BASE_MISSING` with exit 1 before any mount, transfer or purge, leaving `state/` unmutated - the frozen manifest predates the base file, so the pipeline refuses to guess. The suite mocks `rclone`; it does not exercise the mount, the tar build, or the push.
+
 ## [5.7.0] - 2026-09-12
 
 ### Fixed

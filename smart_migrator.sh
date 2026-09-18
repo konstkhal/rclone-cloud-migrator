@@ -5,7 +5,7 @@
 # ==============================================================================
 # Description: On-the-fly streaming tar-archiver and raw copy tool with queue.
 # Framework: Modular pseudoclass-style Bash CLI (Core/Engine/System namespaces).
-# Version: 5.7.0
+# Version: 5.8.0
 # ==============================================================================
 
 set -eo pipefail
@@ -993,6 +993,8 @@ PACKER_PURGE_ON_SUCCESS="no"
 PACKER_NEXT_CHUNK_IDX=0
 PACKER_STATE_FILE=""
 PACKER_MANIFEST_FILE=""
+PACKER_MANIFEST_BASE_FILE=""
+PACKER_RESUME_SKIP=0
 PACKER_DST_DIR=""
 
 declare -a PACKER_MANIFEST_PATHS=()
@@ -1021,6 +1023,7 @@ Packer::init() {
     task_key=$(Core::task_key "$PACKER_SOURCE_PATH" "$dst_dir")
     PACKER_STATE_FILE="${state_dir}/.chunk_idx__${task_key}.state"
     PACKER_MANIFEST_FILE="${state_dir}/.manifest__${task_key}.tsv"
+    PACKER_MANIFEST_BASE_FILE="${state_dir}/.manifest_base__${task_key}.state"
 
     if [ -f "$PACKER_STATE_FILE" ]; then
         PACKER_NEXT_CHUNK_IDX=$(cat "$PACKER_STATE_FILE" 2>/dev/null)
@@ -1051,6 +1054,112 @@ Packer::init() {
 Packer::persist_chunk_idx() {
     local idx="$1" tmp="${PACKER_STATE_FILE}.tmp.$$"
     printf '%s\n' "$idx" > "$tmp" && mv "$tmp" "$PACKER_STATE_FILE"
+}
+
+# The naming offset in force when a manifest was frozen. Written on every
+# freeze, overwriting any prior value, so a manifest deleted by hand and
+# rescanned can never be read against a base left by an earlier freeze.
+Packer::persist_manifest_base() {
+    local idx="$1" tmp="${PACKER_MANIFEST_BASE_FILE}.tmp.$$"
+    printf '%s\n' "$idx" > "$tmp" && mv "$tmp" "$PACKER_MANIFEST_BASE_FILE"
+}
+
+# How many batches of the CURRENT manifest a resume must skip.
+#
+# PACKER_NEXT_CHUNK_IDX is the next tar NAME index on the destination, not a
+# position inside this manifest. The two are equal only when the manifest was
+# frozen with no naming offset in force. Treating the name index as a position
+# is what silently skipped 86,975 files of docu_trans_process between
+# 2026-09-12 and 2026-09-18: the manifest was frozen while an offset of 34 was
+# in force, two batches ran, the index persisted as 36, and every later run
+# dropped 36 batches of a manifest that had only ever completed two.
+#
+# Publishes the result in PACKER_RESUME_SKIP as well as on stdout: the caller
+# must not use a command substitution, because the halts below would then kill
+# only the subshell.
+Packer::resume_skip_count() {
+    PACKER_RESUME_SKIP=0
+
+    # A manifest frozen THIS run came from a live scan that already reflects
+    # current remote reality — already-purged files were never scanned into it.
+    # Any non-zero index is then a pure naming offset, and skipping would treat
+    # real remaining work as done.
+    if [ "$PACKER_MANIFEST_REUSED" != "yes" ]; then
+        printf '%s\n' "0"
+        return 0
+    fi
+
+    local base=""
+    if [ -s "$PACKER_MANIFEST_BASE_FILE" ]; then
+        base=$(cat "$PACKER_MANIFEST_BASE_FILE" 2>/dev/null)
+        [[ "$base" =~ ^[0-9]+$ ]] || base=""
+    fi
+    if [ -z "$base" ]; then
+        Diagnostics::halt_chunk_pipeline "RESUME_BASE_MISSING" \
+            "Frozen manifest $PACKER_MANIFEST_FILE has no usable base offset in $PACKER_MANIFEST_BASE_FILE. Refusing to assume 0 — that assumption is what silently abandoned 86,975 files of docu_trans_process. Delete the manifest to force a rescan, which records a base." \
+            "" "" "$PACKER_SOURCE_PATH" "$PACKER_DST_DIR"
+        # shellcheck disable=SC2317
+        # Unreachable in production — Diagnostics::halt_chunk_pipeline exits.
+        # Kept so the guard still reports failure when that halt is stubbed.
+        return 1
+    fi
+
+    local skip=$((PACKER_NEXT_CHUNK_IDX - base))
+    if [ "$skip" -lt 0 ] || [ "$skip" -gt "${#PACKER_CHUNKS[@]}" ]; then
+        Diagnostics::halt_chunk_pipeline "RESUME_INCONSISTENT" \
+            "Resume skip of $skip batch(es) (next chunk index $PACKER_NEXT_CHUNK_IDX minus manifest base $base) is outside this manifest's ${#PACKER_CHUNKS[@]} batch(es). State and manifest disagree; refusing to guess." \
+            "" "" "$PACKER_SOURCE_PATH" "$PACKER_DST_DIR"
+        # shellcheck disable=SC2317
+        # Unreachable in production — Diagnostics::halt_chunk_pipeline exits.
+        # Kept so the guard still reports failure when that halt is stubbed.
+        return 1
+    fi
+
+    PACKER_RESUME_SKIP="$skip"
+    printf '%s\n' "$skip"
+}
+
+# Proves the work is actually finished before the pipeline may return 0. The
+# incident this guards against reported "All 10 chunk(s) processed
+# successfully" and exited 0 with 169.96 GiB still in the source.
+Packer::assert_complete() {
+    local src="$1" purge="$2" processed="$3" planned="$4"
+
+    if [ -n "$DRY_RUN_FLAG" ]; then
+        log_info "[DRY-RUN] Completion assertion skipped."
+        return 0
+    fi
+
+    if [ "$purge" != "yes" ]; then
+        # Nothing was deleted, so the source proves nothing. Assert the plan
+        # was consumed instead.
+        if [ "$processed" -ne "$planned" ]; then
+            log_err "Completion contract violated: $processed of $planned planned batch(es) processed under purge=no."
+            return 1
+        fi
+        log_info "Completion verified: all $planned planned batch(es) processed."
+        return 0
+    fi
+
+    local listing remaining
+    listing=$(mktemp)
+    # shellcheck disable=SC2086
+    # $DROPBOX_PACER_FLAGS is a flag string that must word-split, same as every
+    # other rclone call in this script.
+    if ! rclone lsf -R --files-only "$src" $DROPBOX_PACER_FLAGS "${RCLONE_LOG_FLAGS[@]}" > "$listing" 2>/dev/null; then
+        rm -f "$listing"
+        log_err "Completion contract could not be verified: listing $src failed. Not reporting success on an unverified source."
+        return 1
+    fi
+    remaining=$(wc -l < "$listing")
+    rm -f "$listing"
+
+    if [ "$remaining" -gt 0 ]; then
+        log_err "Completion contract violated: $remaining file(s) still present under $src after the purge queue drained. This run did NOT finish the migration."
+        return 1
+    fi
+    log_info "Completion verified: $src is drained."
+    return 0
 }
 
 # Resume-safety filter (async-purge crash recovery). Async purge (v5.0.0)
@@ -1152,7 +1261,8 @@ Packer::scan_payload() {
         if [ -s "$scan_file" ]; then
             LC_ALL=C sort -t $'\t' -k2 -o "$scan_file" "$scan_file"
             cp "$scan_file" "$PACKER_MANIFEST_FILE"
-            log_info "Froze manifest: $(wc -l < "$PACKER_MANIFEST_FILE") file(s) -> $PACKER_MANIFEST_FILE (remote will not be re-scanned again for this task)."
+            Packer::persist_manifest_base "$PACKER_NEXT_CHUNK_IDX"
+            log_info "Froze manifest: $(wc -l < "$PACKER_MANIFEST_FILE") file(s) -> $PACKER_MANIFEST_FILE (remote will not be re-scanned again for this task; naming base $PACKER_NEXT_CHUNK_IDX recorded)."
         fi
     fi
 
@@ -1561,6 +1671,14 @@ Purger::daemon_loop() {
 }
 
 Purger::start() {
+    # One daemon per run. Purger::daemon_loop dequeues by find-then-rm rather
+    # than atomically, so a second daemon would select the same manifest and
+    # race it. if-form, not `[ ] &&`: a bare failed test as the last command
+    # would propagate through set -e.
+    if [ -n "$PURGER_PID" ]; then
+        log_warn "Async purger already running (pid ${PURGER_PID}); not starting a second."
+        return 0
+    fi
     Purger::daemon_loop &
     PURGER_PID=$!
     log_info "Async purger started (pid ${PURGER_PID})."
@@ -1686,35 +1804,37 @@ run_tar_chunk_pipeline() {
 
     Packer::generate_chunks
 
-    # Packer::apply_resume_filter (inside Packer::scan_payload) only ever
-    # subtracts files whose purge is still QUEUED (state/pending_purge) — the
-    # crash-recovery window between a chunk's remote verify and its purge
-    # completing. It was never the mechanism that hid FULLY completed and
-    # already-purged chunks: previously that fell out for free, because a
-    # fresh `rclone lsf` naturally no longer listed files that were actually
-    # deleted. A frozen manifest never re-lists, so those files never leave
-    # it — hence this explicit position-based skip is now required, safe
-    # ONLY because the frozen manifest makes Packer::generate_chunks
-    # deterministic across runs (same manifest + same chunk_bytes always
-    # bins identically), so the first PACKER_NEXT_CHUNK_IDX chunks it
-    # produces are guaranteed to be the exact chunks already pushed+purged.
-    #
-    # Only applies when REUSING a manifest frozen by an earlier run of this
-    # same task. When the manifest was just frozen THIS run (PACKER_MANIFEST_REUSED
-    # == no), it came from a live scan that already reflects current remote
-    # reality — e.g. a first run under this task_key against a folder another
-    # tool (or a lost state file) already partially archived: PACKER_NEXT_CHUNK_IDX
-    # is then a pure destination-reconciled naming offset, not a count of
-    # entries still sitting in THIS manifest, and already-purged files were
-    # never scanned into it to begin with. Skipping here would silently treat
-    # real remaining work as already done.
-    if [ "$PACKER_MANIFEST_REUSED" == "yes" ] && [ "$PACKER_NEXT_CHUNK_IDX" -gt 0 ]; then
-        PACKER_CHUNKS=("${PACKER_CHUNKS[@]:$PACKER_NEXT_CHUNK_IDX}")
-        log_info "Resuming: skipping $PACKER_NEXT_CHUNK_IDX already-completed chunk(s); ${#PACKER_CHUNKS[@]} remaining."
+    # A frozen manifest never re-lists, so files from completed chunks stay in
+    # it and the position-based skip below is what stands in for their absence.
+    # The count comes from Packer::resume_skip_count, which subtracts the
+    # naming base recorded at freeze time — see that function for why the raw
+    # chunk index is the wrong number. Deliberately not a command substitution:
+    # its halts must kill this process, not a subshell.
+    if ! Packer::resume_skip_count >/dev/null; then
+        exit 1
+    fi
+    if [ "$PACKER_RESUME_SKIP" -gt 0 ]; then
+        PACKER_CHUNKS=("${PACKER_CHUNKS[@]:$PACKER_RESUME_SKIP}")
+        log_info "Resuming: skipping $PACKER_RESUME_SKIP batch(es) of this manifest already completed; ${#PACKER_CHUNKS[@]} remaining."
     fi
 
     if [ ${#PACKER_CHUNKS[@]} -eq 0 ]; then
-        log_info "All chunks for $src were already completed in a prior run. Nothing left to do."
+        log_info "All chunks for $src were already completed in a prior run."
+        # Drain first: a previous run may have been killed between a chunk's
+        # remote verify and its purge, leaving manifests queued. Asserting a
+        # drained source before those run would fail for the wrong reason.
+        if [ "$PACKER_PURGE_ON_SUCCESS" == "yes" ] && [ -z "$DRY_RUN_FLAG" ]; then
+            Purger::init
+            Purger::start
+            local leftover_fail_detail
+            if ! Purger::drain || ! leftover_fail_detail=$(Purger::check_failed); then
+                Diagnostics::halt_chunk_pipeline "ASYNC_PURGE" "${leftover_fail_detail:-$(cat "$PURGER_FAIL_FLAG" 2>/dev/null)}" "" "" "$src" "$dst_dir"
+            fi
+        fi
+        if ! Packer::assert_complete "$src" "$PACKER_PURGE_ON_SUCCESS" 0 0; then
+            Diagnostics::halt_chunk_pipeline "COMPLETION_CONTRACT" "This task has no batches left to process, but its completion contract does not hold (see the error above). The migration is incomplete; delete $PACKER_MANIFEST_FILE to force a fresh scan of what actually remains." "" "" "$src" "$dst_dir"
+        fi
+        log_info "Nothing left to do."
         return 0
     fi
 
@@ -1843,6 +1963,10 @@ run_tar_chunk_pipeline() {
         if ! Purger::drain || ! drain_fail_detail=$(Purger::check_failed); then
             Diagnostics::halt_chunk_pipeline "ASYNC_PURGE" "${drain_fail_detail:-$(cat "$PURGER_FAIL_FLAG" 2>/dev/null)}" "" "" "$src" "$dst_dir"
         fi
+    fi
+
+    if ! Packer::assert_complete "$src" "$PACKER_PURGE_ON_SUCCESS" "$chunk_total" "$chunk_total"; then
+        Diagnostics::halt_chunk_pipeline "COMPLETION_CONTRACT" "Every batch of this run's plan completed, but the completion contract does not hold (see the error above). Do not treat this task as migrated; delete $PACKER_MANIFEST_FILE to force a fresh scan of what actually remains." "" "" "$src" "$dst_dir"
     fi
 
     log_info "All ${chunk_total} chunk(s) for $src processed successfully."

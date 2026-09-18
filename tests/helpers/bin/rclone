@@ -1,0 +1,21 @@
+#!/bin/bash
+# Test double for rclone. Records every invocation so a test can assert the
+# real binary would never have been called, and answers listings from files
+# named by the environment. It never touches a network or a remote.
+printf '%s\n' "$*" >> "${FAKE_RCLONE_CALLS:?FAKE_RCLONE_CALLS unset}"
+
+case " $* " in
+    *" lsf "*)
+        case " $* " in
+            *" -R "*)
+                [ -n "${FAKE_RCLONE_RECURSIVE_OUT:-}" ] && [ -f "$FAKE_RCLONE_RECURSIVE_OUT" ] \
+                    && cat "$FAKE_RCLONE_RECURSIVE_OUT"
+                ;;
+            *)
+                [ -n "${FAKE_RCLONE_LSF_OUT:-}" ] && [ -f "$FAKE_RCLONE_LSF_OUT" ] \
+                    && cat "$FAKE_RCLONE_LSF_OUT"
+                ;;
+        esac
+        ;;
+esac
+exit "${FAKE_RCLONE_EXIT:-0}"
