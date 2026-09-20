@@ -18,6 +18,10 @@ All notable changes to `rclone-cloud-migrator` are documented in this file.
 
 Verified with `bats tests/resume_arithmetic.bats` (15/15) and `shellcheck`, which matches the pre-change baseline exactly (10x SC2086, 1x SC2004, both pre-existing). The two SC2317 findings introduced are suppressed at the line with their reason. Additionally exercised against the real `docu_trans_process` state, where the new guard halted at `RESUME_BASE_MISSING` with exit 1 before any mount, transfer or purge, leaving `state/` unmutated - the frozen manifest predates the base file, so the pipeline refuses to guess. The suite mocks `rclone`; it does not exercise the mount, the tar build, or the push.
 
+Live-validated 2026-09-20 against the gap this release exists to close. A single run (2026-09-18 15:50 to 2026-09-20 15:52, 47h47m wall clock, ~4h55m of it laptop suspend) drained `docu_trans_process` completely: base offset 52 recorded at freeze, 34 batches computed, all 34 pushed as parts 053-086 and remote-verified byte-exact, 86,975 of 86,975 manifest files purged. Verified independently of the script: 86 part tars on the destination with no gaps and no duplicate names, this run's 34 summing to 170.03 GiB against the 169.96 GiB gap (tar headers and block padding account for the difference), `rclone lsf -R --files-only` on the source returning zero files, and an empty `state/pending_purge/`. Both contract paths were exercised for real: the mount, tar build and push on the long run, and the `already completed in a prior run` early return on a subsequent restart, which logged `Completion verified: ... is drained` and exited 0.
+
+One contract weakness surfaced in the process, and it fails in the safe direction. The contract's source re-listing has no tolerance for a connection dying under it: a 70-minute lid-close suspend killed the listing mid-flight, so the run halted on `COMPLETION_CONTRACT` with exit 1 despite its data being complete and correct. The halt advice - delete the frozen manifest and rescan - is right for a contract that genuinely finds residue and wrong for one whose listing merely failed. Not addressed here.
+
 ## [5.7.0] - 2026-09-12
 
 ### Fixed
